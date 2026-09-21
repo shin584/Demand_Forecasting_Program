@@ -1,0 +1,9 @@
+# Raw pharmacy extracts contain PII-adjacent data and must stay local-only
+# (see CONTEXT.md "PII Policy") — but the extraction script itself isn't data.
+/dataset/D/
+/dataset/*.csv
+/dataset/*.xlsx
+
+__pycache__/
+*.pyc
+.pytest_cache/
