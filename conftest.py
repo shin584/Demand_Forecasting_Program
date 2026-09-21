@@ -88,3 +88,29 @@ def make_raw_visits(rows: list[dict]) -> pd.DataFrame:
     for date_col in _DATE_COLUMNS:
         df[date_col] = pd.to_datetime(df[date_col])
     return df
+
+
+# Two dedicated drug IDs, each given more occurrences than any real test
+# fixture is expected to use for its own drugs.
+NOISE_DRUG_IDS = (90001, 90002)
+
+
+def make_high_frequency_filler_visits(occurrences: int = 3) -> list[dict]:
+    """Visit rows guaranteeing NOISE_DRUG_IDS are the dataset's top-2
+    highest-frequency drugs, each on its own single-visit customer.
+
+    Prepend this to a raw_visits fixture (`make_raw_visits(make_high_frequency_filler_visits() + [...])`)
+    so a test's own drugs are never accidentally swept into the Revisit
+    Match top-2 exclusion (see ADR-0001) just because too few distinct
+    drugs exist in the fixture - a real drug only needs to appear in fewer
+    than `occurrences` visits to be safe from exclusion.
+    """
+    rows = []
+    visit_id = 900000
+    customer_id = 900000
+    for drug_id in NOISE_DRUG_IDS:
+        for _ in range(occurrences):
+            rows.append(make_visit_row(조제판매ID=visit_id, 고객ID=customer_id, 약품ID=drug_id))
+            visit_id += 1
+            customer_id += 1
+    return rows
