@@ -70,6 +70,88 @@ def test_build_marts_is_deterministic_and_side_effect_free():
     pd.testing.assert_frame_equal(raw_visits, raw_visits_before)
 
 
+def test_mart2_uses_latest_consumption_at_or_before_as_of_date():
+    raw_visits = make_raw_visits(
+        [
+            make_visit_row(
+                조제판매ID=1, 고객ID=1, 내방일="2024-01-01", 약품ID=1, 소모량=30.0
+            ),
+            make_visit_row(
+                조제판매ID=2, 고객ID=1, 내방일="2024-02-01", 약품ID=1, 소모량=60.0
+            ),
+        ]
+    )
+
+    mart2 = build_marts(raw_visits, as_of_date="2024-02-01").mart2
+
+    value = mart2.set_index(["고객ID", "약품ID"])["최근소모량"]
+    assert value.loc[(1, 1)] == 60.0
+
+
+def test_mart2_excludes_visits_after_as_of_date():
+    raw_visits = make_raw_visits(
+        [
+            make_visit_row(
+                조제판매ID=1, 고객ID=1, 내방일="2024-01-01", 약품ID=1, 소모량=30.0
+            ),
+            # Later than as_of_date - must not leak into the mart.
+            make_visit_row(
+                조제판매ID=2, 고객ID=1, 내방일="2024-03-01", 약품ID=1, 소모량=999.0
+            ),
+        ]
+    )
+
+    mart2 = build_marts(raw_visits, as_of_date="2024-01-15").mart2
+
+    value = mart2.set_index(["고객ID", "약품ID"])["최근소모량"]
+    assert value.loc[(1, 1)] == 30.0
+
+
+def test_mart2_differs_across_as_of_dates_on_the_same_raw_dataset():
+    raw_visits = make_raw_visits(
+        [
+            make_visit_row(
+                조제판매ID=1, 고객ID=1, 내방일="2024-01-01", 약품ID=1, 소모량=30.0
+            ),
+            make_visit_row(
+                조제판매ID=2, 고객ID=1, 내방일="2024-02-01", 약품ID=1, 소모량=60.0
+            ),
+        ]
+    )
+
+    early = build_marts(raw_visits, as_of_date="2024-01-01").mart2
+    late = build_marts(raw_visits, as_of_date="2024-02-01").mart2
+
+    early_value = early.set_index(["고객ID", "약품ID"])["최근소모량"].loc[(1, 1)]
+    late_value = late.set_index(["고객ID", "약품ID"])["최근소모량"].loc[(1, 1)]
+    assert early_value != late_value
+    assert early_value == 30.0
+    assert late_value == 60.0
+
+
+def test_mart2_is_per_customer_and_drug():
+    raw_visits = make_raw_visits(
+        [
+            make_visit_row(
+                조제판매ID=1, 고객ID=1, 내방일="2024-01-01", 약품ID=1, 소모량=30.0
+            ),
+            make_visit_row(
+                조제판매ID=1, 고객ID=1, 내방일="2024-01-01", 약품ID=2, 소모량=15.0
+            ),
+            make_visit_row(
+                조제판매ID=2, 고객ID=2, 내방일="2024-01-01", 약품ID=1, 소모량=99.0
+            ),
+        ]
+    )
+
+    mart2 = build_marts(raw_visits, as_of_date="2024-01-01").mart2
+
+    value = mart2.set_index(["고객ID", "약품ID"])["최근소모량"]
+    assert value.loc[(1, 1)] == 30.0
+    assert value.loc[(1, 2)] == 15.0
+    assert value.loc[(2, 1)] == 99.0
+
+
 def test_mart1_includes_only_chronic_patients_and_derives_chronic_flag():
     raw_visits = make_raw_visits(
         make_high_frequency_filler_visits()

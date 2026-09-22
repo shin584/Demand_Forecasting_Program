@@ -4,7 +4,8 @@ Mart 1 (Visit-Probability), Mart 2 (Customer Drug Profile) and Mart 3
 
 See CONTEXT.md and docs/adr/ for the design decisions this pipeline encodes.
 This module currently implements the pipeline scaffolding, Mart 1's Y label,
-and Revisit Match-based Chronic/Acute routing; later tickets fill in the
+Revisit Match-based Chronic/Acute routing, Mart 2's as-of-date consumption
+values, and as-of-date family visit totals; later tickets fill in the
 remaining columns of all three marts.
 """
 
@@ -18,16 +19,20 @@ CUSTOMER_ID_COL = "고객ID"
 VISIT_ID_COL = "조제판매ID"
 VISIT_DATE_COL = "내방일"
 NEXT_EXPECTED_VISIT_COL = "다음내방일"
+FAMILY_ID_COL = "가족ID"
 DRUG_ID_COL = "약품ID"
+CONSUMPTION_COL = "소모량"
 NEXT_DAY_VISIT_COL = "내일_방문"
 CHRONIC_COL = "만성질환여부"
+FAMILY_VISIT_COUNT_COL = "가족_총내방"
+MART2_VALUE_COL = "최근소모량"
 
 # Internal-only columns, not part of the raw_visits schema.
 _DRUG_SET_COL = "_drug_set"
 _CLEAN_DRUG_SET_COL = "_clean_drug_set"
 
 MART1_COLUMNS = [CUSTOMER_ID_COL, NEXT_DAY_VISIT_COL, CHRONIC_COL]
-MART2_COLUMNS = ["고객ID", "약품ID", "최근소모량"]
+MART2_COLUMNS = [CUSTOMER_ID_COL, DRUG_ID_COL, MART2_VALUE_COL]
 MART3_COLUMNS = ["약품ID", "계절", "요일", "소모량"]
 
 # Revisit Match criterion H+T2 (see docs/adr/0001-chronic-patient-behavioral-definition.md).
@@ -52,7 +57,7 @@ def build_marts(raw_visits: pd.DataFrame, as_of_date) -> MartResult:
     as_of_date = pd.Timestamp(as_of_date)
     chronic_customer_ids = _chronic_customer_ids(raw_visits)
     mart1 = _build_mart1(raw_visits, as_of_date, chronic_customer_ids)
-    mart2 = pd.DataFrame(columns=MART2_COLUMNS)
+    mart2 = _build_mart2(raw_visits, as_of_date)
     # Acute-patient visits (every visit whose customer isn't in
     # chronic_customer_ids) are Mart 3's population; the season x weekday
     # aggregation itself is a later ticket's job (see issue #9).
@@ -103,14 +108,17 @@ def revisit_match(raw_visits: pd.DataFrame) -> pd.Series:
     return is_match
 
 
+def _one_row_per_visit(raw_visits: pd.DataFrame, cols: list) -> pd.DataFrame:
+    """One row per 조제판매ID (a visit may dispense several drugs, one raw row
+    each), keeping the first value of each of `cols`."""
+    return raw_visits.groupby(VISIT_ID_COL, sort=False).agg(
+        **{col: (col, "first") for col in cols}
+    )
+
+
 def _visits_with_drug_sets(raw_visits: pd.DataFrame) -> pd.DataFrame:
-    """One row per 조제판매ID (a visit may dispense several drugs, one raw row each)."""
-    visits = raw_visits.groupby(VISIT_ID_COL, sort=False).agg(
-        **{
-            CUSTOMER_ID_COL: (CUSTOMER_ID_COL, "first"),
-            VISIT_DATE_COL: (VISIT_DATE_COL, "first"),
-            NEXT_EXPECTED_VISIT_COL: (NEXT_EXPECTED_VISIT_COL, "first"),
-        }
+    visits = _one_row_per_visit(
+        raw_visits, [CUSTOMER_ID_COL, VISIT_DATE_COL, NEXT_EXPECTED_VISIT_COL]
     )
     visits[_DRUG_SET_COL] = raw_visits.groupby(VISIT_ID_COL, sort=False)[DRUG_ID_COL].agg(
         lambda drug_ids: frozenset(drug_ids.dropna())
@@ -179,3 +187,59 @@ def _build_mart1(
             CHRONIC_COL: customers.isin(chronic_customer_ids),
         }
     )
+
+
+def family_totals_as_of(raw_visits: pd.DataFrame, as_of_date) -> pd.DataFrame:
+    """가족_총내방 (family cumulative visit count) computed as of `as_of_date`.
+
+    For each 가족ID, counts that family's distinct visits (조제판매ID) whose
+    내방일 falls strictly before `as_of_date` — cumulative up to but excluding
+    as_of_date itself, per docs/adr/0002-point-in-time-correctness.md — never
+    the live `tbl가족총매출` snapshot already sitting on raw_visits.
+
+    가족_총매출 (family revenue) is deliberately not computed here: raw_visits
+    carries no per-visit monetary amount, only drug consumption quantities in
+    units that aren't comparable across drugs, so there's no correct way to
+    recompute it from the columns build_marts receives today. See issue #10.
+
+    Returns one row per 가족ID with columns [가족ID, 가족_총내방].
+    """
+    as_of_date = pd.Timestamp(as_of_date)
+    visits = _one_row_per_visit(raw_visits, [FAMILY_ID_COL, VISIT_DATE_COL])
+
+    families = (
+        visits[[FAMILY_ID_COL]]
+        .drop_duplicates()
+        .sort_values(FAMILY_ID_COL)
+        .reset_index(drop=True)
+    )
+    prior_visits = visits[visits[VISIT_DATE_COL] < as_of_date]
+    counts = prior_visits.groupby(FAMILY_ID_COL).size()
+    families[FAMILY_VISIT_COUNT_COL] = (
+        families[FAMILY_ID_COL].map(counts).fillna(0).astype(int)
+    )
+    return families
+
+
+def _build_mart2(raw_visits: pd.DataFrame, as_of_date: pd.Timestamp) -> pd.DataFrame:
+    """Per 고객ID×약품ID, the latest single-visit consumption amount at or
+    before `as_of_date` — never the global-latest value across the whole
+    extract, per docs/adr/0002-point-in-time-correctness.md.
+    """
+    visit_dates = pd.to_datetime(raw_visits[VISIT_DATE_COL])
+    eligible = raw_visits.loc[visit_dates <= as_of_date].dropna(subset=[DRUG_ID_COL])
+    if eligible.empty:
+        return pd.DataFrame(columns=MART2_COLUMNS)
+
+    subset = eligible[[CUSTOMER_ID_COL, DRUG_ID_COL, VISIT_DATE_COL, CONSUMPTION_COL]]
+    latest = (
+        subset.sort_values(VISIT_DATE_COL, kind="stable")
+        .groupby([CUSTOMER_ID_COL, DRUG_ID_COL], as_index=False, sort=False)
+        .last()
+    )
+    mart2 = latest[[CUSTOMER_ID_COL, DRUG_ID_COL, CONSUMPTION_COL]].rename(
+        columns={CONSUMPTION_COL: MART2_VALUE_COL}
+    )
+    return mart2.sort_values(
+        [CUSTOMER_ID_COL, DRUG_ID_COL], kind="stable"
+    ).reset_index(drop=True)
