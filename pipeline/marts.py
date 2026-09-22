@@ -4,9 +4,9 @@ Mart 1 (Visit-Probability), Mart 2 (Customer Drug Profile) and Mart 3
 
 See CONTEXT.md and docs/adr/ for the design decisions this pipeline encodes.
 This module currently implements the pipeline scaffolding, Mart 1's Y label,
-Revisit Match-based Chronic/Acute routing, Mart 2's as-of-date consumption
-values, and as-of-date family visit totals; later tickets fill in the
-remaining columns of all three marts.
+Revisit Match-based Chronic/Acute routing, Mart 1's sample-weight tiers,
+Mart 2's as-of-date consumption values, and as-of-date family visit totals;
+later tickets fill in the remaining columns of all three marts.
 """
 
 from __future__ import annotations
@@ -28,6 +28,13 @@ CHRONIC_COL = "만성질환여부"
 FAMILY_VISIT_COUNT_COL = "가족_총내방"
 MART2_VALUE_COL = "최근소모량"
 SNAPSHOT_DATE_COL = "기준일자"
+WEIGHT_COL = "학습_가중치"
+
+# Severity/특례 eligibility flags (see CONTEXT.md "Severe/특례 Weight Tier").
+# 차상위대상자 is deliberately excluded here -- it's a copay-assistance
+# signal, not a severity signal, and belongs as an X-feature instead (see
+# issue #6 and ADR-0001's sibling discussion in CONTEXT.md).
+SEVERITY_FLAG_COLS = ["중증암등록대상자", "산전산모대상자", "희귀난치대상자"]
 
 # Internal-only columns, not part of the raw_visits schema.
 _DRUG_SET_COL = "_drug_set"
@@ -40,6 +47,15 @@ MART3_COLUMNS = ["약품ID", "계절", "요일", "소모량"]
 # Revisit Match criterion H+T2 (see docs/adr/0001-chronic-patient-behavioral-definition.md).
 REVISIT_MATCH_WINDOW_DAYS = 30
 TOP_FREQUENT_DRUG_EXCLUDE_COUNT = 2
+
+# Mart 1's 학습_가중치 sample-weight tiers (see CONTEXT.md "Severe/특례 Weight
+# Tier"): severity takes priority over chronic, which takes priority over the
+# baseline. Placeholder values pending empirical tuning against
+# validation-set precision/recall -- not fixed business requirements (see
+# CONTEXT.md "Decision Thresholds (provisional)").
+SEVERITY_TIER_WEIGHT = 3.0
+CHRONIC_TIER_WEIGHT = 2.0
+BASELINE_WEIGHT = 1.0
 
 # Mart 1's Y=0 negative-sampling scheme (see CONTEXT.md "Negative Sampling
 # Windows" and docs/Research-Log.md's absolute-day 초기(1~5일차)/중기(15일차)/
@@ -175,6 +191,78 @@ def _chronic_customer_ids(raw_visits: pd.DataFrame) -> set:
     return set(visit_customers.loc[matched_visit_ids])
 
 
+def sample_mart1_weights(
+    raw_visits: pd.DataFrame,
+    chronic_customer_ids: set | None = None,
+    severity_weight: float = SEVERITY_TIER_WEIGHT,
+    chronic_weight: float = CHRONIC_TIER_WEIGHT,
+    baseline_weight: float = BASELINE_WEIGHT,
+) -> pd.Series:
+    """Mart 1's 학습_가중치 (sample weight), per 고객ID (see CONTEXT.md
+    "Severe/특례 Weight Tier").
+
+    The severity tier (`severity_weight`, default 3.0) applies to any
+    customer with >=1 visit where 중증암등록대상자, 산전산모대상자 or
+    희귀난치대상자 is true, regardless of chronic status. Otherwise the
+    chronic tier (`chronic_weight`, default 2.0) applies to Chronic Patients
+    (per Revisit Match, see ADR-0001). Otherwise the baseline
+    (`baseline_weight`, default 1.0) applies. 차상위대상자 never affects this
+    weight -- it's a copay-assistance signal, not a severity signal.
+
+    `chronic_customer_ids` can be passed in to reuse a result already
+    computed by `build_marts`; otherwise it's derived here via
+    `revisit_match`.
+
+    Not yet wired into `build_marts`'s mart1 output -- a later ticket
+    assembles this alongside Mart 1's other columns.
+    """
+    if chronic_customer_ids is None:
+        chronic_customer_ids = _chronic_customer_ids(raw_visits)
+    severity_customer_ids = _severity_customer_ids(raw_visits)
+
+    customers = _distinct_customer_ids(raw_visits)
+    weights = pd.Series(
+        baseline_weight, index=customers.index, dtype=float, name=WEIGHT_COL
+    )
+    # Severity assigned after chronic so it wins where a customer is both.
+    weights[customers.isin(chronic_customer_ids)] = chronic_weight
+    weights[customers.isin(severity_customer_ids)] = severity_weight
+    weights.index = pd.Index(customers, name=CUSTOMER_ID_COL)
+    return weights
+
+
+def _distinct_customer_ids(raw_visits: pd.DataFrame, mask=None) -> pd.Series:
+    """Distinct 고객ID values (optionally restricted to `mask`), sorted
+    ascending with a fresh 0..n-1 index -- the customer-listing shape shared
+    by Mart 1's population and its sample-weight lookup."""
+    customer_ids = raw_visits[CUSTOMER_ID_COL]
+    if mask is not None:
+        customer_ids = customer_ids[mask]
+    return customer_ids.drop_duplicates().sort_values().reset_index(drop=True)
+
+
+def _severity_customer_ids(raw_visits: pd.DataFrame) -> set:
+    """Customers with >=1 visit where 중증암등록대상자, 산전산모대상자 or
+    희귀난치대상자 is true -- the severity sample-weight tier (see
+    CONTEXT.md "Severe/특례 Weight Tier")."""
+    if raw_visits.empty:
+        return set()
+    mask = pd.Series(False, index=raw_visits.index)
+    for col in SEVERITY_FLAG_COLS:
+        mask = mask | _eligibility_flag_mask(raw_visits[col])
+    return set(raw_visits.loc[mask, CUSTOMER_ID_COL])
+
+
+def _eligibility_flag_mask(column: pd.Series) -> pd.Series:
+    """True where a raw 대상자 eligibility flag column value represents
+    'yes'.
+
+    Source columns store 'Y' (case-insensitive) for membership and
+    None/NaN/blank otherwise (see docs/Research-Log.md "학습 가중치").
+    """
+    return column.astype("string").str.strip().str.upper().eq("Y").fillna(False)
+
+
 def negative_sample_offsets(prescription_days: float) -> list[int]:
     """Day-offsets (relative to an anchoring visit) for Mart 1's Y=0
     negative-sampling scheme (see CONTEXT.md "Negative Sampling Windows").
@@ -261,12 +349,7 @@ def _build_mart1(
     target_date = as_of_date + pd.Timedelta(days=1)
 
     chronic_mask = raw_visits[CUSTOMER_ID_COL].isin(chronic_customer_ids)
-    customers = (
-        raw_visits.loc[chronic_mask, CUSTOMER_ID_COL]
-        .drop_duplicates()
-        .sort_values()
-        .reset_index(drop=True)
-    )
+    customers = _distinct_customer_ids(raw_visits, mask=chronic_mask)
 
     # 내일_방문 is the literal "did the customer actually show up on
     # as_of_date + 1" boolean — independent of Revisit Match, which is a
