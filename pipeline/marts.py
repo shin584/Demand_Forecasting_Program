@@ -19,6 +19,7 @@ CUSTOMER_ID_COL = "고객ID"
 VISIT_ID_COL = "조제판매ID"
 VISIT_DATE_COL = "내방일"
 NEXT_EXPECTED_VISIT_COL = "다음내방일"
+PRESCRIPTION_DAYS_COL = "처방조제일수"
 FAMILY_ID_COL = "가족ID"
 DRUG_ID_COL = "약품ID"
 CONSUMPTION_COL = "소모량"
@@ -26,6 +27,7 @@ NEXT_DAY_VISIT_COL = "내일_방문"
 CHRONIC_COL = "만성질환여부"
 FAMILY_VISIT_COUNT_COL = "가족_총내방"
 MART2_VALUE_COL = "최근소모량"
+SNAPSHOT_DATE_COL = "기준일자"
 
 # Internal-only columns, not part of the raw_visits schema.
 _DRUG_SET_COL = "_drug_set"
@@ -38,6 +40,21 @@ MART3_COLUMNS = ["약품ID", "계절", "요일", "소모량"]
 # Revisit Match criterion H+T2 (see docs/adr/0001-chronic-patient-behavioral-definition.md).
 REVISIT_MATCH_WINDOW_DAYS = 30
 TOP_FREQUENT_DRUG_EXCLUDE_COUNT = 2
+
+# Mart 1's Y=0 negative-sampling scheme (see CONTEXT.md "Negative Sampling
+# Windows" and docs/Research-Log.md's absolute-day 초기(1~5일차)/중기(15일차)/
+# 말기(27~29일차) scheme this generalizes into proportions of each patient's
+# own 처방조제일수 cycle length): ~15% early, ~50% mid, ~90-96% late (up to 3
+# samples). 1 early + 1 mid + 3 late, against 1 assumed positive per cycle,
+# is what produces the accepted ~1:5 ratio -- not the superseded "1:3" figure.
+NEGATIVE_SAMPLE_FRACTIONS = (0.15, 0.50, 0.90, 0.93, 0.96)
+
+MART1_NEGATIVE_SAMPLE_COLUMNS = [
+    CUSTOMER_ID_COL,
+    VISIT_ID_COL,
+    SNAPSHOT_DATE_COL,
+    NEXT_DAY_VISIT_COL,
+]
 
 
 class MartResult(NamedTuple):
@@ -81,8 +98,7 @@ def revisit_match(raw_visits: pd.DataFrame) -> pd.Series:
     )
 
     is_match = pd.Series(False, index=visits.index)
-    for _, group in visits.groupby(CUSTOMER_ID_COL, sort=False):
-        ordered = group.sort_values(VISIT_DATE_COL, kind="stable")
+    for ordered in _visits_by_customer_ordered(visits):
         records = ordered.to_dict("records")
         row_positions = ordered.index.to_list()
 
@@ -106,6 +122,14 @@ def revisit_match(raw_visits: pd.DataFrame) -> pd.Series:
     is_match.index = visits[VISIT_ID_COL]
     is_match.index.name = VISIT_ID_COL
     return is_match
+
+
+def _visits_by_customer_ordered(visits: pd.DataFrame):
+    """Yield each customer's visits (one group per 고객ID), sorted
+    chronologically by 내방일 (stable, so same-day visits keep their
+    original relative order)."""
+    for _, group in visits.groupby(CUSTOMER_ID_COL, sort=False):
+        yield group.sort_values(VISIT_DATE_COL, kind="stable")
 
 
 def _one_row_per_visit(raw_visits: pd.DataFrame, cols: list) -> pd.DataFrame:
@@ -149,6 +173,82 @@ def _chronic_customer_ids(raw_visits: pd.DataFrame) -> set:
         CUSTOMER_ID_COL
     ]
     return set(visit_customers.loc[matched_visit_ids])
+
+
+def negative_sample_offsets(prescription_days: float) -> list[int]:
+    """Day-offsets (relative to an anchoring visit) for Mart 1's Y=0
+    negative-sampling scheme (see CONTEXT.md "Negative Sampling Windows").
+
+    Offsets are proportions of `prescription_days` - that visit's own
+    처방조제일수 cycle length - rather than fixed absolute days, so sampling
+    stays meaningful whether the observed cycle is 7 days or 60+. Every
+    offset is >=1 day so no negative sample can land on or before the
+    anchoring visit itself; offsets a short cycle rounds onto the same day
+    are collapsed, so a very short cycle yields fewer than 5 samples.
+    """
+    offsets = {
+        max(1, round(prescription_days * fraction))
+        for fraction in NEGATIVE_SAMPLE_FRACTIONS
+    }
+    return sorted(offsets)
+
+
+def negative_sample_dates(visit_date, prescription_days: float) -> list[pd.Timestamp]:
+    """Candidate Mart 1 Y=0 snapshot dates for one anchoring visit, via the
+    early/mid/late window scheme (see negative_sample_offsets)."""
+    visit_date = pd.Timestamp(visit_date)
+    return [
+        visit_date + pd.Timedelta(days=offset)
+        for offset in negative_sample_offsets(prescription_days)
+    ]
+
+
+def sample_mart1_negatives(
+    raw_visits: pd.DataFrame, chronic_customer_ids: set | None = None
+) -> pd.DataFrame:
+    """Mart 1's Y=0 negative-sample rows, via the early/mid/late window
+    scheme, for every Chronic Patient (see ADR-0001) patient-cycle - a visit
+    that has a later visit by the same customer, bounding the cycle the
+    offsets are sampled within.
+
+    One row per (anchoring visit, sampled offset), dated that visit's own
+    내방일 plus the offset. A customer's chronologically last known visit
+    never anchors a cycle - it has no later visit, so there's nothing to
+    bound the sampling window with, and it's what supplies the "1 assumed
+    positive per cycle" that the accepted ~1:5 ratio is measured against.
+    `chronic_customer_ids` can be passed in to reuse a result already
+    computed by `build_marts`; otherwise it's derived here via
+    `revisit_match`.
+
+    Not yet wired into `build_marts`'s mart1 output - a later ticket
+    assembles this alongside the Next-Day Visit positives into Mart 1's full
+    historical training rows.
+    """
+    if chronic_customer_ids is None:
+        chronic_customer_ids = _chronic_customer_ids(raw_visits)
+    if not chronic_customer_ids:
+        return pd.DataFrame(columns=MART1_NEGATIVE_SAMPLE_COLUMNS)
+
+    visits = _one_row_per_visit(
+        raw_visits, [CUSTOMER_ID_COL, VISIT_DATE_COL, PRESCRIPTION_DAYS_COL]
+    )
+    visits = visits[visits[CUSTOMER_ID_COL].isin(chronic_customer_ids)]
+
+    rows = []
+    for ordered in _visits_by_customer_ordered(visits):
+        for visit_id, visit in ordered.iloc[:-1].iterrows():
+            for snapshot_date in negative_sample_dates(
+                visit[VISIT_DATE_COL], visit[PRESCRIPTION_DAYS_COL]
+            ):
+                rows.append(
+                    {
+                        CUSTOMER_ID_COL: visit[CUSTOMER_ID_COL],
+                        VISIT_ID_COL: visit_id,
+                        SNAPSHOT_DATE_COL: snapshot_date,
+                        NEXT_DAY_VISIT_COL: False,
+                    }
+                )
+    return pd.DataFrame(rows, columns=MART1_NEGATIVE_SAMPLE_COLUMNS)
 
 
 def _build_mart1(
