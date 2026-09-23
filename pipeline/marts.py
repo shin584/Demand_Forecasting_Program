@@ -6,9 +6,9 @@ See CONTEXT.md and docs/adr/ for the design decisions this pipeline encodes.
 This module currently implements the pipeline scaffolding, Mart 1's Y label,
 Revisit Match-based Chronic/Acute routing, Mart 1's sample-weight tiers,
 Mart 1's remaining X-features (demographics, as-of family loyalty,
-visit-timing/medication and insurance/차상위 features -- except 가족_총매출,
-still blocked on issue #10), Mart 2's as-of-date consumption values, and
-as-of-date family visit totals; later tickets fill in Mart 3.
+visit-timing/medication and insurance/차상위 features -- 가족_총매출 is
+permanently out of scope, see below), Mart 2's as-of-date consumption
+values, and as-of-date family visit totals; later tickets fill in Mart 3.
 """
 
 from __future__ import annotations
@@ -56,10 +56,11 @@ SEVERITY_FLAG_COLS = ["중증암등록대상자", "산전산모대상자", "희�
 _DRUG_SET_COL = "_drug_set"
 _CLEAN_DRUG_SET_COL = "_clean_drug_set"
 
-# 가족_총매출 (as-of) is not yet included: the raw extract has no per-visit
-# monetary amount to recompute it from point-in-time (see issue #10, which
-# #7 depends on for this one column). Every other Mart 1 X-feature issue #7
-# calls for is here.
+# 가족_총매출 (as-of) is permanently out of scope, not merely deferred: the
+# raw extract has no per-visit monetary amount to recompute it from
+# point-in-time, and the source-DB extraction work to add one (#10) was
+# judged not worth it given 가족_총내방 already covers family loyalty.
+# Every other Mart 1 X-feature issue #7 calls for is here.
 MART1_COLUMNS = [
     CUSTOMER_ID_COL,
     NEXT_DAY_VISIT_COL,
@@ -579,7 +580,9 @@ def family_totals_as_of(raw_visits: pd.DataFrame, as_of_date) -> pd.DataFrame:
     가족_총매출 (family revenue) is deliberately not computed here: raw_visits
     carries no per-visit monetary amount, only drug consumption quantities in
     units that aren't comparable across drugs, so there's no correct way to
-    recompute it from the columns build_marts receives today. See issue #10.
+    recompute it from the columns build_marts receives today. This is a
+    permanent scope decision, not a gap awaiting a future extract change —
+    see docs/adr/0002-point-in-time-correctness.md (closing #10).
 
     Returns one row per 가족ID with columns [가족ID, 가족_총내방].
     """

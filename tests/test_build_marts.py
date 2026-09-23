@@ -186,10 +186,11 @@ def test_mart1_does_not_include_department_or_a_substitute_column():
     assert "처방전발행기관ID" not in mart1.columns
 
 
-def test_family_revenue_not_yet_available_pending_issue_10():
-    # 가족_총매출 (as-of) is not yet a Mart 1 column: the raw extract has no
-    # per-visit monetary amount to recompute it from point-in-time (see
-    # issue #10, which this ticket depends on for that one column).
+def test_family_revenue_permanently_out_of_scope():
+    # 가족_총매출 (as-of) is deliberately not a Mart 1 column: the raw extract
+    # has no per-visit monetary amount to recompute it from point-in-time,
+    # and issue #10 (which would have added one) was closed as wontfix --
+    # see docs/adr/0002-point-in-time-correctness.md.
     raw_visits = make_raw_visits([make_visit_row()])
 
     mart1, _, _ = build_marts(raw_visits, as_of_date="2024-01-01")
