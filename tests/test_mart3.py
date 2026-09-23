@@ -240,7 +240,9 @@ def test_mart3_excludes_a_chronic_only_drug_entirely():
         ]
     )
 
-    mart3 = build_marts(raw_visits, as_of_date="2024-01-01").mart3
+    # as_of_date is at (not before) customer 1's revisit, so the match is
+    # already knowable at this snapshot (see issue #11).
+    mart3 = build_marts(raw_visits, as_of_date="2024-01-15").mart3
 
     assert list(mart3.columns) == MART3_COLUMNS
     assert 1 not in set(mart3[DRUG_ID_COL])

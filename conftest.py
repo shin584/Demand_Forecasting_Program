@@ -114,3 +114,38 @@ def make_high_frequency_filler_visits(occurrences: int = 3) -> list[dict]:
             visit_id += 1
             customer_id += 1
     return rows
+
+
+def make_independent_chronic_match_visits(
+    customer_id: int, drug_id: int, visit_id_start: int
+) -> list[dict]:
+    """Two visit rows forming an already-resolved Revisit Match, dated well
+    before any as_of_date a test built around this fixture would exercise --
+    establishes `customer_id` as Chronic (see ADR-0001) without depending on,
+    or disturbing the timing of, whatever other visit that test anchors on or
+    needs to still be in the future relative to as_of_date.
+
+    Needed because Chronic/Acute classification only considers visits with
+    내방일 <= as_of_date (see issue #11 and
+    docs/adr/0002-point-in-time-correctness.md): a test that also wants to
+    exercise some other as-of-date-sensitive behavior (which visit anchors,
+    a Y-label lookup, a family visit count, ...) needs its customer's Chronic
+    status established independently of that behavior's own visit dates.
+
+    Give each call its own `drug_id` and `visit_id_start` (unused elsewhere
+    in that test's fixture) so this pair doesn't collide with other visits'
+    조제판매ID values or get swept into the Revisit Match top-2 frequency
+    exclusion.
+    """
+    return [
+        make_visit_row(
+            조제판매ID=visit_id_start,
+            고객ID=customer_id,
+            내방일="2023-11-01",
+            다음내방일="2023-12-01",
+            약품ID=drug_id,
+        ),
+        make_visit_row(
+            조제판매ID=visit_id_start + 1, 고객ID=customer_id, 내방일="2023-11-15", 약품ID=drug_id
+        ),
+    ]

@@ -4,7 +4,9 @@ Mart 1 (Visit-Probability), Mart 2 (Customer Drug Profile) and Mart 3
 
 See CONTEXT.md and docs/adr/ for the design decisions this pipeline encodes.
 This module currently implements the pipeline scaffolding, Mart 1's Y label,
-Revisit Match-based Chronic/Acute routing, Mart 1's sample-weight tiers,
+Revisit Match-based Chronic/Acute routing (recomputed as of each `build_marts`
+call's own as_of_date, per docs/adr/0002-point-in-time-correctness.md),
+Mart 1's sample-weight tiers,
 Mart 1's remaining X-features (demographics, as-of family loyalty,
 visit-timing/medication and insurance/차상위 features -- 가족_총매출 is
 permanently out of scope, see below -- plus MPR adherence score and
@@ -185,11 +187,18 @@ def build_marts(
     outputs and the same entry point can be reused for training, backtesting,
     and live inference (see docs/adr/0002-point-in-time-correctness.md).
 
+    Chronic/Acute (Revisit Match) classification is recomputed from only the
+    visits with 내방일 <= `as_of_date` -- a visit dated after `as_of_date`
+    must not be able to make an earlier snapshot's classification "Chronic"
+    (see docs/adr/0002-point-in-time-correctness.md, "Update (implementing
+    #11)"). Mart 1 inclusion, 만성질환여부, and Mart 3's population routing
+    all derive from this one as-of-correct result.
+
     `mart3_min_observations` (default `MART3_MIN_OBSERVATIONS`) is Mart 3's
     sparse-bucket backoff threshold (see `resolve_mart3_backoff`).
     """
     as_of_date = pd.Timestamp(as_of_date)
-    chronic_customer_ids = _chronic_customer_ids(raw_visits)
+    chronic_customer_ids = _chronic_customer_ids(_visits_at_or_before(raw_visits, as_of_date))
     mart1 = _build_mart1(raw_visits, as_of_date, chronic_customer_ids)
     mart2 = _build_mart2(raw_visits, as_of_date)
     mart3 = _build_mart3(
@@ -200,6 +209,14 @@ def build_marts(
 
 def revisit_match(raw_visits: pd.DataFrame) -> pd.Series:
     """The Revisit Match matcher (criterion H+T2, see ADR-0001).
+
+    Takes `raw_visits` as-is and has no `as_of_date` parameter: as-of-date
+    filtering is the caller's responsibility (pre-filter `raw_visits` to
+    visits with 내방일 <= as_of_date before calling), not something this
+    function does itself. `build_marts` does exactly that via
+    `_visits_at_or_before` before deriving Chronic/Acute status, so this
+    signature - and every existing direct call to it - stays unchanged (see
+    docs/adr/0002-point-in-time-correctness.md, "Update (implementing #11)").
 
     Returns a boolean Series indexed by 조제판매ID: True if some later visit
     by the same customer shares >=1 drug with this visit - excluding the
@@ -238,6 +255,17 @@ def revisit_match(raw_visits: pd.DataFrame) -> pd.Series:
     is_match.index = visits[VISIT_ID_COL]
     is_match.index.name = VISIT_ID_COL
     return is_match
+
+
+def _visits_at_or_before(raw_visits: pd.DataFrame, as_of_date: pd.Timestamp) -> pd.DataFrame:
+    """`raw_visits` restricted to rows with 내방일 <= `as_of_date` -- what's
+    actually knowable as of that snapshot. Shared by every as-of-date
+    computation that must not see visits from after `as_of_date` (Chronic/
+    Acute classification, Mart 2's latest-consumption lookup, Mart 3's
+    observation population), per docs/adr/0002-point-in-time-correctness.md.
+    """
+    visit_dates = pd.to_datetime(raw_visits[VISIT_DATE_COL])
+    return raw_visits.loc[visit_dates <= as_of_date]
 
 
 def _visits_by_customer_ordered(visits: pd.DataFrame):
@@ -284,7 +312,16 @@ def _top_frequent_drug_ids(raw_visits: pd.DataFrame, top_n: int) -> set:
 
 
 def _chronic_customer_ids(raw_visits: pd.DataFrame) -> set:
-    """Customers with >=1 Revisit Match visit - Chronic Patients (see ADR-0001)."""
+    """Customers with >=1 Revisit Match visit - Chronic Patients (see ADR-0001).
+
+    Classifies from exactly the visits in `raw_visits` - it does no as-of-date
+    filtering itself. `build_marts` passes in `_visits_at_or_before(raw_visits,
+    as_of_date)` so a visit after the snapshot date can't retroactively make an
+    earlier snapshot "Chronic" (see docs/adr/0002-point-in-time-correctness.md).
+    Called directly with the full, unfiltered table elsewhere (e.g.
+    `sample_mart1_weights`, `sample_mart1_negatives`), where the current
+    live-snapshot classification is exactly what's wanted.
+    """
     if raw_visits.empty:
         return set()
     matches = revisit_match(raw_visits)
@@ -745,8 +782,7 @@ def _build_mart2(raw_visits: pd.DataFrame, as_of_date: pd.Timestamp) -> pd.DataF
     before `as_of_date` — never the global-latest value across the whole
     extract, per docs/adr/0002-point-in-time-correctness.md.
     """
-    visit_dates = pd.to_datetime(raw_visits[VISIT_DATE_COL])
-    eligible = raw_visits.loc[visit_dates <= as_of_date].dropna(subset=[DRUG_ID_COL])
+    eligible = _visits_at_or_before(raw_visits, as_of_date).dropna(subset=[DRUG_ID_COL])
     if eligible.empty:
         return pd.DataFrame(columns=MART2_COLUMNS)
 
@@ -785,11 +821,8 @@ def _mart3_observations(
     correctness for backtesting/inference reuse, see
     docs/adr/0002-point-in-time-correctness.md).
     """
-    visit_dates = pd.to_datetime(raw_visits[VISIT_DATE_COL])
-    acute_mask = ~raw_visits[CUSTOMER_ID_COL].isin(chronic_customer_ids)
-    eligible = raw_visits.loc[acute_mask & (visit_dates <= as_of_date)].dropna(
-        subset=[DRUG_ID_COL]
-    )
+    acute_visits = raw_visits.loc[~raw_visits[CUSTOMER_ID_COL].isin(chronic_customer_ids)]
+    eligible = _visits_at_or_before(acute_visits, as_of_date).dropna(subset=[DRUG_ID_COL])
     if eligible.empty:
         return pd.DataFrame(columns=MART3_COLUMNS)
 

@@ -1,7 +1,12 @@
 import pandas as pd
 import pytest
 
-from conftest import make_high_frequency_filler_visits, make_raw_visits, make_visit_row
+from conftest import (
+    make_high_frequency_filler_visits,
+    make_independent_chronic_match_visits,
+    make_raw_visits,
+    make_visit_row,
+)
 from pipeline.marts import MART1_COLUMNS, MART2_COLUMNS, MART3_COLUMNS, build_marts
 
 
@@ -27,15 +32,18 @@ def test_next_day_visit_label_true_positive_and_true_negative():
     raw_visits = make_raw_visits(
         make_high_frequency_filler_visits()
         + [
-            # Customer 1: actually visits the day right after the snapshot date,
-            # and is Chronic (Revisit Match on 약품ID=1, within the window of
-            # its 다음내방일) so it remains in Mart 1 to check the Y label.
+            # Independent Revisit Matches, resolved before the snapshot date,
+            # make both customers Chronic without relying on the next-day-visit
+            # pairs below, since as-of-date-correct classification can't see
+            # either pair's second visit yet at as_of_date="2024-01-01".
+            *make_independent_chronic_match_visits(customer_id=1, drug_id=101, visit_id_start=10),
+            *make_independent_chronic_match_visits(customer_id=2, drug_id=102, visit_id_start=12),
+            # Customer 1: actually visits the day right after the snapshot date.
             make_visit_row(
                 조제판매ID=1, 고객ID=1, 내방일="2024-01-01", 다음내방일="2024-01-31", 약품ID=1
             ),
             make_visit_row(조제판매ID=2, 고객ID=1, 내방일="2024-01-02", 약품ID=1),
             # Customer 2: has a later visit, but not the immediate next day.
-            # Also Chronic (Revisit Match on 약품ID=2) for the same reason.
             make_visit_row(
                 조제판매ID=3, 고객ID=2, 내방일="2024-01-01", 다음내방일="2024-01-31", 약품ID=2
             ),
@@ -157,7 +165,8 @@ def test_mart1_includes_only_chronic_patients_and_derives_chronic_flag():
     raw_visits = make_raw_visits(
         make_high_frequency_filler_visits()
         + [
-            # Customer 1: Chronic - has a genuine Revisit Match.
+            # Customer 1: Chronic - has a genuine Revisit Match, resolved by
+            # (and visible as of) the as_of_date used below.
             make_visit_row(
                 조제판매ID=1, 고객ID=1, 내방일="2024-01-01", 다음내방일="2024-01-31", 약품ID=1
             ),
@@ -170,10 +179,64 @@ def test_mart1_includes_only_chronic_patients_and_derives_chronic_flag():
         ]
     )
 
-    mart1, _, _ = build_marts(raw_visits, as_of_date="2024-01-01")
+    # as_of_date is at (not before) customer 1's revisit, so the match is
+    # already knowable at this snapshot (see issue #11).
+    mart1, _, _ = build_marts(raw_visits, as_of_date="2024-02-15")
 
     assert set(mart1["고객ID"]) == {1}
     assert mart1.set_index("고객ID")["만성질환여부"].loc[1] == True  # noqa: E712
+
+
+def test_chronic_classification_excludes_a_match_visit_after_as_of_date():
+    # Customer 1's only Revisit Match is via a visit strictly after
+    # as_of_date -- classification at that earlier as_of_date must not be
+    # able to see it, so customer 1 is Acute (not Chronic) as of that
+    # snapshot (see issue #11).
+    raw_visits = make_raw_visits(
+        make_high_frequency_filler_visits()
+        + [
+            make_visit_row(
+                조제판매ID=1, 고객ID=1, 내방일="2024-01-01", 다음내방일="2024-01-31", 약품ID=1
+            ),
+            # The only visit that would make customer 1 Chronic -- dated
+            # after the as_of_date used below.
+            make_visit_row(조제판매ID=2, 고객ID=1, 내방일="2024-02-15", 약품ID=1),
+        ]
+    )
+
+    result = build_marts(raw_visits, as_of_date="2024-01-01")
+
+    assert 1 not in set(result.mart1["고객ID"])
+    # Acute as of this snapshot, so its consumption routes into Mart 3
+    # instead of being excluded as a Chronic-only drug.
+    assert 1 in set(result.mart3["약품ID"])
+
+
+def test_chronic_classification_changes_across_snapshots_on_the_same_raw_dataset():
+    # Same customer, same raw_visits: Acute as of an earlier snapshot (the
+    # matching visit hasn't happened yet), Chronic as of a later one (once it
+    # has) -- classification can change across snapshots for the same
+    # raw_visits, mirroring test_mart2_differs_across_as_of_dates_on_the_same_raw_dataset
+    # (see issue #11).
+    raw_visits = make_raw_visits(
+        make_high_frequency_filler_visits()
+        + [
+            make_visit_row(
+                조제판매ID=1, 고객ID=1, 내방일="2024-01-01", 다음내방일="2024-01-31", 약품ID=1
+            ),
+            make_visit_row(조제판매ID=2, 고객ID=1, 내방일="2024-02-15", 약품ID=1),
+        ]
+    )
+
+    early = build_marts(raw_visits, as_of_date="2024-01-01")
+    late = build_marts(raw_visits, as_of_date="2024-02-15")
+
+    assert 1 not in set(early.mart1["고객ID"])
+    assert 1 in set(late.mart1["고객ID"])
+    assert late.mart1.set_index("고객ID")["만성질환여부"].loc[1] == True  # noqa: E712
+
+    assert 1 in set(early.mart3["약품ID"])
+    assert 1 not in set(late.mart3["약품ID"])
 
 
 def test_mart1_does_not_include_department_or_a_substitute_column():
@@ -203,6 +266,12 @@ def test_primary_ingredient_matches_the_drug_with_longest_medication_days():
     raw_visits = make_raw_visits(
         make_high_frequency_filler_visits()
         + [
+            # An independent Revisit Match, fully resolved before the
+            # anchoring visit below, makes customer 1 Chronic without moving
+            # which visit anchors (see issue #11 -- classification can only
+            # use visits <= as_of_date, so a later match couldn't be used
+            # here without also becoming the anchoring visit itself).
+            *make_independent_chronic_match_visits(customer_id=1, drug_id=101, visit_id_start=10),
             # Same visit, two drugs -- 주요_약품속명/장기투약_일수 must follow
             # whichever drug has the longer 투약일수 (drug 2), not row order.
             make_visit_row(
@@ -223,8 +292,6 @@ def test_primary_ingredient_matches_the_drug_with_longest_medication_days():
                 투약일수=30,
                 속명="ingredientB",
             ),
-            # A later visit so customer 1 qualifies as Chronic (Revisit Match).
-            make_visit_row(조제판매ID=2, 고객ID=1, 내방일="2024-01-15", 약품ID=2),
         ]
     )
 
@@ -239,16 +306,19 @@ def test_tomorrow_is_expected_visit_matches_as_of_date_plus_one_day():
     raw_visits = make_raw_visits(
         make_high_frequency_filler_visits()
         + [
+            # Independent Revisit Matches, resolved before the anchoring
+            # visits below, establish Chronic status for both customers
+            # (see issue #11).
+            *make_independent_chronic_match_visits(customer_id=1, drug_id=101, visit_id_start=10),
+            *make_independent_chronic_match_visits(customer_id=2, drug_id=102, visit_id_start=12),
             # Customer 1: anchoring visit's 다음내방일 is exactly as_of_date + 1.
             make_visit_row(
                 조제판매ID=1, 고객ID=1, 내방일="2024-01-01", 다음내방일="2024-01-02", 약품ID=1
             ),
-            make_visit_row(조제판매ID=2, 고객ID=1, 내방일="2024-01-10", 약품ID=1),
             # Customer 2: anchoring visit's 다음내방일 is NOT as_of_date + 1.
             make_visit_row(
                 조제판매ID=3, 고객ID=2, 내방일="2024-01-01", 다음내방일="2024-01-20", 약품ID=2
             ),
-            make_visit_row(조제판매ID=4, 고객ID=2, 내방일="2024-01-15", 약품ID=2),
         ]
     )
 
@@ -263,6 +333,10 @@ def test_days_since_last_visit_and_remaining_medication_days():
     raw_visits = make_raw_visits(
         make_high_frequency_filler_visits()
         + [
+            # Independent Revisit Match, resolved before the as_of_date used
+            # below, establishes Chronic status without affecting which
+            # visit anchors (see issue #11).
+            *make_independent_chronic_match_visits(customer_id=1, drug_id=101, visit_id_start=10),
             make_visit_row(
                 조제판매ID=1,
                 고객ID=1,
@@ -313,6 +387,12 @@ def test_mart1_family_visit_count_is_shared_and_as_of_date():
     raw_visits = make_raw_visits(
         make_high_frequency_filler_visits()
         + [
+            # Independent Revisit Matches, resolved before as_of_date, make
+            # both family members Chronic (see issue #11) without touching
+            # the family-visit-count history being tested below. (가족ID isn't
+            # set by the helper -- defaults to 1, matching this family.)
+            *make_independent_chronic_match_visits(customer_id=1, drug_id=101, visit_id_start=10),
+            *make_independent_chronic_match_visits(customer_id=2, drug_id=102, visit_id_start=12),
             # Family 1, two members (고객ID 1 and 2), sharing 가족ID=1.
             make_visit_row(
                 조제판매ID=1,
@@ -451,6 +531,11 @@ def test_mpr_is_na_when_last_eligible_visits_prescription_days_is_missing():
     raw_visits = make_raw_visits(
         make_high_frequency_filler_visits()
         + [
+            # Independent Revisit Match, dated before the visit below, makes
+            # customer 1 Chronic (see issue #11) without changing which
+            # visit is chronologically last among the eligible (<=
+            # as_of_date) ones the MPR calculation keys off.
+            *make_independent_chronic_match_visits(customer_id=1, drug_id=101, visit_id_start=10),
             make_visit_row(
                 조제판매ID=1,
                 고객ID=1,
