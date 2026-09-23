@@ -8,8 +8,9 @@ Revisit Match-based Chronic/Acute routing, Mart 1's sample-weight tiers,
 Mart 1's remaining X-features (demographics, as-of family loyalty,
 visit-timing/medication and insurance/차상위 features -- 가족_총매출 is
 permanently out of scope, see below -- plus MPR adherence score and
-per-patient no-show rate), Mart 2's as-of-date consumption values, and
-as-of-date family visit totals; later tickets fill in Mart 3.
+per-patient no-show rate), Mart 2's as-of-date consumption values,
+as-of-date family visit totals, and Mart 3's drug x season x weekday
+aggregation with sparse-bucket backoff.
 """
 
 from __future__ import annotations
@@ -67,6 +68,11 @@ SEVERITY_FLAG_COLS = ["중증암등록대상자", "산전산모대상자", "희�
 # Internal-only columns, not part of the raw_visits schema.
 _DRUG_SET_COL = "_drug_set"
 _CLEAN_DRUG_SET_COL = "_clean_drug_set"
+_BUCKET_MEAN_COL = "_bucket_mean"
+_BUCKET_COUNT_COL = "_bucket_count"
+_SEASON_MEAN_COL = "_season_mean"
+_SEASON_COUNT_COL = "_season_count"
+_DRUG_MEAN_COL = "_drug_mean"
 
 # 가족_총매출 (as-of) is permanently out of scope, not merely deferred: the
 # raw extract has no per-visit monetary amount to recompute it from
@@ -90,7 +96,34 @@ MART1_COLUMNS = [
     *MPR_NO_SHOW_FEATURE_COLS,
 ]
 MART2_COLUMNS = [CUSTOMER_ID_COL, DRUG_ID_COL, MART2_VALUE_COL]
-MART3_COLUMNS = ["약품ID", "계절", "요일", "소모량"]
+SEASON_COL = "계절"
+WEEKDAY_COL = "요일"
+MART3_COLUMNS = [DRUG_ID_COL, SEASON_COL, WEEKDAY_COL, CONSUMPTION_COL]
+
+# Mart 3's fixed bucket axes (see CONTEXT.md "Mart 3 (Acute Drug Statistics
+# Mart)" and "Track 2 Sparse-Bucket Backoff"): standard meteorological
+# seasons, and Korean weekday names (matching dataset/D's weekday-named
+# folders). Every drug present in Mart 3's population gets a row for every
+# one of these 4x7 = 28 combinations, regardless of which buckets that drug
+# actually has observations in -- a drug with zero winter sales still gets a
+# 겨울 row, backed off rather than omitted, since CONTEXT.md's ~72%-sparse
+# figure describes the typical case, not an edge case to skip.
+MART3_SEASONS = ["봄", "여름", "가을", "겨울"]
+MART3_WEEKDAYS = ["월요일", "화요일", "수요일", "목요일", "금요일", "토요일", "일요일"]
+
+_MONTH_TO_SEASON = {
+    3: "봄", 4: "봄", 5: "봄",
+    6: "여름", 7: "여름", 8: "여름",
+    9: "가을", 10: "가을", 11: "가을",
+    12: "겨울", 1: "겨울", 2: "겨울",
+}
+_WEEKDAY_INDEX_TO_NAME = dict(enumerate(MART3_WEEKDAYS))
+
+# Mart 3's sparse-bucket backoff threshold (see CONTEXT.md "Track 2
+# Sparse-Bucket Backoff" -- "threshold TBD empirically" -- and issue #1's
+# suggested default of 5). Placeholder pending empirical tuning, not a fixed
+# business requirement (see CONTEXT.md "Decision Thresholds (provisional)").
+MART3_MIN_OBSERVATIONS = 5
 
 # Mart 1's X-features anchored to each customer's most recent visit at or
 # before as_of_date (see _anchoring_visit_features) -- shared by that
@@ -140,22 +173,28 @@ class MartResult(NamedTuple):
     mart3: pd.DataFrame
 
 
-def build_marts(raw_visits: pd.DataFrame, as_of_date) -> MartResult:
+def build_marts(
+    raw_visits: pd.DataFrame,
+    as_of_date,
+    mart3_min_observations: int = MART3_MIN_OBSERVATIONS,
+) -> MartResult:
     """Build Mart 1/2/3 from raw visit-level rows, as of a given snapshot date.
 
     Pure and deterministic: reads only `as_of_date` (never wall-clock "today")
     and never mutates `raw_visits`, so the same inputs always produce the same
     outputs and the same entry point can be reused for training, backtesting,
     and live inference (see docs/adr/0002-point-in-time-correctness.md).
+
+    `mart3_min_observations` (default `MART3_MIN_OBSERVATIONS`) is Mart 3's
+    sparse-bucket backoff threshold (see `resolve_mart3_backoff`).
     """
     as_of_date = pd.Timestamp(as_of_date)
     chronic_customer_ids = _chronic_customer_ids(raw_visits)
     mart1 = _build_mart1(raw_visits, as_of_date, chronic_customer_ids)
     mart2 = _build_mart2(raw_visits, as_of_date)
-    # Acute-patient visits (every visit whose customer isn't in
-    # chronic_customer_ids) are Mart 3's population; the season x weekday
-    # aggregation itself is a later ticket's job (see issue #9).
-    mart3 = pd.DataFrame(columns=MART3_COLUMNS)
+    mart3 = _build_mart3(
+        raw_visits, as_of_date, chronic_customer_ids, mart3_min_observations
+    )
     return MartResult(mart1=mart1, mart2=mart2, mart3=mart3)
 
 
@@ -723,3 +762,119 @@ def _build_mart2(raw_visits: pd.DataFrame, as_of_date: pd.Timestamp) -> pd.DataF
     return mart2.sort_values(
         [CUSTOMER_ID_COL, DRUG_ID_COL], kind="stable"
     ).reset_index(drop=True)
+
+
+def _seasons_for(dates: pd.Series) -> pd.Series:
+    """Each date's 계절 (season), per `_MONTH_TO_SEASON`."""
+    return dates.dt.month.map(_MONTH_TO_SEASON)
+
+
+def _weekdays_for(dates: pd.Series) -> pd.Series:
+    """Each date's 요일 (Korean weekday name), per `MART3_WEEKDAYS`."""
+    return dates.dt.dayofweek.map(_WEEKDAY_INDEX_TO_NAME)
+
+
+def _mart3_observations(
+    raw_visits: pd.DataFrame, as_of_date: pd.Timestamp, chronic_customer_ids: set
+) -> pd.DataFrame:
+    """One row per Acute-Patient drug-consumption observation at or before
+    `as_of_date` — Mart 3's population, the Revisit Match complement of
+    Chronic (see ADR-0001; Chronic-patient visits belong to Mart 1 instead
+    and never contribute here). Each row's 계절/요일 are derived from its own
+    내방일, matching `_build_mart2`'s `<=` as-of cutoff (point-in-time
+    correctness for backtesting/inference reuse, see
+    docs/adr/0002-point-in-time-correctness.md).
+    """
+    visit_dates = pd.to_datetime(raw_visits[VISIT_DATE_COL])
+    acute_mask = ~raw_visits[CUSTOMER_ID_COL].isin(chronic_customer_ids)
+    eligible = raw_visits.loc[acute_mask & (visit_dates <= as_of_date)].dropna(
+        subset=[DRUG_ID_COL]
+    )
+    if eligible.empty:
+        return pd.DataFrame(columns=MART3_COLUMNS)
+
+    eligible_dates = pd.to_datetime(eligible[VISIT_DATE_COL])
+    return pd.DataFrame(
+        {
+            DRUG_ID_COL: eligible[DRUG_ID_COL],
+            SEASON_COL: _seasons_for(eligible_dates),
+            WEEKDAY_COL: _weekdays_for(eligible_dates),
+            CONSUMPTION_COL: eligible[CONSUMPTION_COL],
+        }
+    ).reset_index(drop=True)
+
+
+def resolve_mart3_backoff(
+    observations: pd.DataFrame, min_observations: int = MART3_MIN_OBSERVATIONS
+) -> pd.DataFrame:
+    """Mart 3's drug x season x weekday grid, from one row per Acute-Patient
+    drug-consumption observation (columns 약품ID, 계절, 요일, 소모량).
+
+    Every drug present in `observations` gets one row for each of the 28
+    MART3_SEASONS x MART3_WEEKDAYS combinations, via hierarchical backoff
+    (see CONTEXT.md "Track 2 Sparse-Bucket Backoff"):
+
+    1. That bucket's own average, if the bucket has >= `min_observations`
+       observations.
+    2. Else that drug's season-only average (across every weekday), if the
+       season has >= `min_observations` observations.
+    3. Else that drug's overall average — used unconditionally as the final
+       fallback, regardless of how few observations it itself rests on, so
+       every bucket resolves to a usable estimate rather than null/zero.
+
+    Kept as its own function — reachable through `build_marts`'s Mart 3
+    output for ordinary use — so a test can exercise the backoff hierarchy
+    directly against a small synthetic observation table without needing a
+    full multi-visit raw_visits dataset.
+    """
+    drug_ids = sorted(observations[DRUG_ID_COL].unique())
+    if not drug_ids:
+        return pd.DataFrame(columns=MART3_COLUMNS)
+
+    bucket_stats = (
+        observations.groupby([DRUG_ID_COL, SEASON_COL, WEEKDAY_COL])[CONSUMPTION_COL]
+        .agg(**{_BUCKET_MEAN_COL: "mean", _BUCKET_COUNT_COL: "count"})
+        .reset_index()
+    )
+    season_stats = (
+        observations.groupby([DRUG_ID_COL, SEASON_COL])[CONSUMPTION_COL]
+        .agg(**{_SEASON_MEAN_COL: "mean", _SEASON_COUNT_COL: "count"})
+        .reset_index()
+    )
+    drug_stats = (
+        observations.groupby(DRUG_ID_COL)[CONSUMPTION_COL]
+        .mean()
+        .rename(_DRUG_MEAN_COL)
+        .reset_index()
+    )
+
+    grid = pd.MultiIndex.from_product(
+        [drug_ids, MART3_SEASONS, MART3_WEEKDAYS],
+        names=[DRUG_ID_COL, SEASON_COL, WEEKDAY_COL],
+    ).to_frame(index=False)
+    grid = grid.merge(bucket_stats, on=[DRUG_ID_COL, SEASON_COL, WEEKDAY_COL], how="left")
+    grid = grid.merge(season_stats, on=[DRUG_ID_COL, SEASON_COL], how="left")
+    grid = grid.merge(drug_stats, on=DRUG_ID_COL, how="left")
+
+    # NaN counts (bucket/season combinations absent from `observations`)
+    # compare False against min_observations, correctly treated as sparse.
+    bucket_sufficient = grid[_BUCKET_COUNT_COL] >= min_observations
+    season_sufficient = grid[_SEASON_COUNT_COL] >= min_observations
+
+    grid[CONSUMPTION_COL] = grid[_DRUG_MEAN_COL]
+    grid.loc[season_sufficient, CONSUMPTION_COL] = grid.loc[season_sufficient, _SEASON_MEAN_COL]
+    grid.loc[bucket_sufficient, CONSUMPTION_COL] = grid.loc[bucket_sufficient, _BUCKET_MEAN_COL]
+
+    return grid[MART3_COLUMNS]
+
+
+def _build_mart3(
+    raw_visits: pd.DataFrame,
+    as_of_date: pd.Timestamp,
+    chronic_customer_ids: set,
+    min_observations: int = MART3_MIN_OBSERVATIONS,
+) -> pd.DataFrame:
+    # No empty-check needed here: resolve_mart3_backoff already returns an
+    # empty MART3_COLUMNS frame when `observations` has no rows.
+    observations = _mart3_observations(raw_visits, as_of_date, chronic_customer_ids)
+    return resolve_mart3_backoff(observations, min_observations)
