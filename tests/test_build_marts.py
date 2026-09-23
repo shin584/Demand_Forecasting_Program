@@ -527,6 +527,52 @@ def test_no_show_rate_undefined_when_no_next_visit_date_has_resolved_yet():
     assert pd.isna(mart1.set_index("고객ID")["노쇼_비율"].loc[1])
 
 
+def test_mart1_includes_learned_weight_column():
+    raw_visits = make_raw_visits(
+        make_high_frequency_filler_visits()
+        + [
+            *make_independent_chronic_match_visits(customer_id=1, drug_id=101, visit_id_start=10),
+            make_visit_row(
+                조제판매ID=1,
+                고객ID=1,
+                내방일="2024-01-01",
+                다음내방일="2024-01-31",
+                약품ID=1,
+                중증암등록대상자="Y",
+            ),
+        ]
+    )
+
+    mart1, _, _ = build_marts(raw_visits, as_of_date="2024-01-01")
+
+    assert mart1.set_index("고객ID")["학습_가중치"].loc[1] == 3.0
+
+
+def test_mart1_weight_severity_status_is_as_of_date_correct():
+    # Customer 1's severity flag only appears on a visit dated after
+    # as_of_date -- must not leak into the weight at the earlier snapshot,
+    # mirroring issue #11's as-of-date correctness fix for chronic status.
+    raw_visits = make_raw_visits(
+        make_high_frequency_filler_visits()
+        + [
+            *make_independent_chronic_match_visits(customer_id=1, drug_id=101, visit_id_start=10),
+            make_visit_row(
+                조제판매ID=1, 고객ID=1, 내방일="2024-01-01", 다음내방일="2024-01-31", 약품ID=1
+            ),
+            # Severity flag only knowable once this later visit is in view.
+            make_visit_row(
+                조제판매ID=20, 고객ID=1, 내방일="2024-06-01", 약품ID=1, 중증암등록대상자="Y"
+            ),
+        ]
+    )
+
+    early = build_marts(raw_visits, as_of_date="2024-01-01").mart1
+    late = build_marts(raw_visits, as_of_date="2024-06-01").mart1
+
+    assert early.set_index("고객ID")["학습_가중치"].loc[1] == 2.0  # chronic tier only
+    assert late.set_index("고객ID")["학습_가중치"].loc[1] == 3.0  # severity now visible
+
+
 def test_mpr_is_na_when_last_eligible_visits_prescription_days_is_missing():
     raw_visits = make_raw_visits(
         make_high_frequency_filler_visits()

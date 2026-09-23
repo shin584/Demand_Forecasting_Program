@@ -6,13 +6,19 @@ See CONTEXT.md and docs/adr/ for the design decisions this pipeline encodes.
 This module currently implements the pipeline scaffolding, Mart 1's Y label,
 Revisit Match-based Chronic/Acute routing (recomputed as of each `build_marts`
 call's own as_of_date, per docs/adr/0002-point-in-time-correctness.md),
-Mart 1's sample-weight tiers,
+Mart 1's sample-weight tiers (wired into both `build_marts`'s single-snapshot
+mart1 output and `build_mart1_training_set`'s historical rows),
 Mart 1's remaining X-features (demographics, as-of family loyalty,
 visit-timing/medication and insurance/차상위 features -- 가족_총매출 is
 permanently out of scope, see below -- plus MPR adherence score and
 per-patient no-show rate), Mart 2's as-of-date consumption values,
-as-of-date family visit totals, and Mart 3's drug x season x weekday
-aggregation with sparse-bucket backoff.
+as-of-date family visit totals, Mart 3's drug x season x weekday
+aggregation with sparse-bucket backoff, `build_mart1_training_set`'s
+assembly of Mart 1's full historical training set (Next-Day Visit positives
+plus early/mid/late negative samples, see that function) as a separate path
+from `build_marts`'s own single as_of_date snapshot, and
+`split_mart1_training_set`'s train/validation/test temporal split of that
+training set.
 """
 
 from __future__ import annotations
@@ -96,6 +102,7 @@ MART1_COLUMNS = [
     INSURANCE_TYPE_COL,
     NEAR_POVERTY_COL,
     *MPR_NO_SHOW_FEATURE_COLS,
+    WEIGHT_COL,
 ]
 MART2_COLUMNS = [CUSTOMER_ID_COL, DRUG_ID_COL, MART2_VALUE_COL]
 SEASON_COL = "계절"
@@ -168,11 +175,34 @@ MART1_NEGATIVE_SAMPLE_COLUMNS = [
     NEXT_DAY_VISIT_COL,
 ]
 
+# build_mart1_training_set's output columns: MART1_COLUMNS (the same X/Y/weight
+# shape build_marts's single-snapshot mart1 uses) plus 기준일자, since a
+# historical training row's own snapshot date -- unlike build_marts's single
+# as_of_date, already known to that call's caller -- has to travel with the
+# row itself (needed for the train/validation/test temporal split, see
+# docs/Plan.md "시계열 분할").
+MART1_TRAINING_COLUMNS = [SNAPSHOT_DATE_COL, *MART1_COLUMNS]
+
+# split_mart1_training_set's window sizes (see docs/Plan.md "시계열 분할").
+# Plan.md's original 2yr/6mo/6mo split assumed ~3 years of history; only the
+# two eval windows are pinned to a fixed size here -- train absorbs whatever
+# span is left before val_months + test_months, computed from the training
+# set's own max 기준일자, never a hardcoded calendar date (so the split stays
+# correct as more history accumulates in future extracts).
+TEST_WINDOW_MONTHS = 6
+VAL_WINDOW_MONTHS = 6
+
 
 class MartResult(NamedTuple):
     mart1: pd.DataFrame
     mart2: pd.DataFrame
     mart3: pd.DataFrame
+
+
+class Mart1Split(NamedTuple):
+    train: pd.DataFrame
+    val: pd.DataFrame
+    test: pd.DataFrame
 
 
 def build_marts(
@@ -184,8 +214,11 @@ def build_marts(
 
     Pure and deterministic: reads only `as_of_date` (never wall-clock "today")
     and never mutates `raw_visits`, so the same inputs always produce the same
-    outputs and the same entry point can be reused for training, backtesting,
-    and live inference (see docs/adr/0002-point-in-time-correctness.md).
+    outputs and the same entry point can be reused for backtesting and live
+    inference, one as_of_date snapshot at a time (see
+    docs/adr/0002-point-in-time-correctness.md). For Mart 1's full historical
+    training set instead -- many rows per customer, across many past
+    snapshot dates -- see `build_mart1_training_set`.
 
     Chronic/Acute (Revisit Match) classification is recomputed from only the
     visits with 내방일 <= `as_of_date` -- a visit dated after `as_of_date`
@@ -205,6 +238,111 @@ def build_marts(
         raw_visits, as_of_date, chronic_customer_ids, mart3_min_observations
     )
     return MartResult(mart1=mart1, mart2=mart2, mart3=mart3)
+
+
+def build_mart1_training_set(raw_visits: pd.DataFrame) -> pd.DataFrame:
+    """Mart 1's full historical training set: one row per Next-Day Visit
+    positive (see `_mart1_positive_samples`) plus one row per
+    `sample_mart1_negatives` Y=0 sample, each with X-features and
+    학습_가중치 attached as of that row's own snapshot date -- unlike
+    `build_marts`, which builds a single as_of_date snapshot meant for daily
+    inference/backtesting one day at a time.
+
+    Chronic/Acute classification and 학습_가중치 tiers are derived once from
+    the full, unfiltered `raw_visits`, not re-derived per row's own snapshot
+    date -- the same live/full-history-by-default behavior
+    `sample_mart1_weights` and `sample_mart1_negatives` already have when
+    called directly (see docs/adr/0002-point-in-time-correctness.md, "Update
+    (implementing #11)"): re-running Revisit Match per distinct historical
+    snapshot date across a full training set would be prohibitively
+    expensive, and which customers are Chronic/severe is being treated here
+    as a population-membership decision for the training set as a whole, not
+    a per-row leakage-sensitive X-feature. Only the point, anchoring,
+    family-total, and MPR/no-show X-features -- the ones point-in-time
+    correctness actually protects (see CONTEXT.md "Point-in-Time
+    Correctness") -- are recomputed per row's own snapshot date, via the same
+    as-of-date helpers `build_marts` uses.
+
+    Materially more expensive than `build_marts`: X-features are recomputed
+    once per distinct historical snapshot date present in the assembled rows
+    (via a groupby), not once for a single date, which is the trade-off
+    accepted for a correct historical training set over `build_marts`'s
+    cheaper single-snapshot use case.
+
+    Returns an empty `MART1_TRAINING_COLUMNS`-shaped frame if `raw_visits`
+    has no Chronic Patients at all.
+    """
+    chronic_customer_ids = _chronic_customer_ids(raw_visits)
+    if not chronic_customer_ids:
+        return pd.DataFrame(columns=MART1_TRAINING_COLUMNS)
+
+    samples = pd.concat(
+        [
+            _mart1_positive_samples(raw_visits, chronic_customer_ids),
+            sample_mart1_negatives(raw_visits, chronic_customer_ids),
+        ],
+        ignore_index=True,
+    )
+
+    # Filled in place, one snapshot_date group at a time, below -- rather
+    # than building a small mart1 frame per group and pd.concat-ing them,
+    # which triggers pandas' "concatenation with empty or all-NA entries"
+    # FutureWarning whenever a group's X-features come back entirely NA
+    # (e.g. a customer with no anchoring visit yet at their earliest
+    # snapshot date, see _attach_mart1_x_features).
+    result = samples.copy()
+    result[CHRONIC_COL] = True
+    # Derived solely from Revisit Match, same as _build_mart1 -- every row
+    # here is already restricted to chronic_customer_ids.
+    feature_cols = [
+        col
+        for col in MART1_COLUMNS
+        if col not in (CUSTOMER_ID_COL, NEXT_DAY_VISIT_COL, CHRONIC_COL, WEIGHT_COL)
+    ]
+    for col in feature_cols:
+        result[col] = pd.NA
+
+    for snapshot_date, group in samples.groupby(SNAPSHOT_DATE_COL, sort=False):
+        features = _attach_mart1_x_features(
+            group[[CUSTOMER_ID_COL, NEXT_DAY_VISIT_COL]].assign(**{CHRONIC_COL: True}),
+            raw_visits,
+            snapshot_date,
+        )
+        result.loc[features.index, feature_cols] = features[feature_cols]
+
+    result = _attach_mart1_weight(result, raw_visits, chronic_customer_ids)
+    return result[MART1_TRAINING_COLUMNS]
+
+
+def split_mart1_training_set(
+    training_set: pd.DataFrame,
+    test_months: int = TEST_WINDOW_MONTHS,
+    val_months: int = VAL_WINDOW_MONTHS,
+) -> Mart1Split:
+    """Splits `build_mart1_training_set`'s output into train/val/test by
+    기준일자 (see docs/Plan.md "시계열 분할"): the most recent `test_months`
+    become test, the `val_months` immediately before that become validation,
+    and everything earlier becomes train.
+
+    Both window boundaries are computed from `training_set`'s own max 기준일자
+    -- never a hardcoded calendar date -- so test and val always land on the
+    same two fixed-size, most-recent windows regardless of how much history
+    `training_set` covers; train simply absorbs whatever's left before them.
+    This is "cut from the end, unrounded": the two eval windows are protected
+    at their planned size, and train isn't padded or trimmed to hit a target
+    proportion.
+
+    Each boundary is inclusive on its more-recent side: a row dated exactly
+    on a cutoff belongs to the newer of the two windows it separates.
+    """
+    snapshot_dates = training_set[SNAPSHOT_DATE_COL]
+    test_start = snapshot_dates.max() - pd.DateOffset(months=test_months)
+    val_start = test_start - pd.DateOffset(months=val_months)
+
+    train = training_set[snapshot_dates < val_start]
+    val = training_set[(snapshot_dates >= val_start) & (snapshot_dates < test_start)]
+    test = training_set[snapshot_dates >= test_start]
+    return Mart1Split(train=train, val=val, test=test)
 
 
 def revisit_match(raw_visits: pd.DataFrame) -> pd.Series:
@@ -354,8 +492,11 @@ def sample_mart1_weights(
     computed by `build_marts`; otherwise it's derived here via
     `revisit_match`.
 
-    Not yet wired into `build_marts`'s mart1 output -- a later ticket
-    assembles this alongside Mart 1's other columns.
+    Wired into Mart 1's 학습_가중치 column via `_attach_mart1_weight`, used by
+    both `build_marts`'s single-snapshot mart1 output (given the same
+    as-of-filtered `raw_visits` chronic/severity status is derived from
+    there) and `build_mart1_training_set`'s historical rows (given the full,
+    unfiltered `raw_visits` -- see that function's docstring for why).
     """
     if chronic_customer_ids is None:
         chronic_customer_ids = _chronic_customer_ids(raw_visits)
@@ -449,9 +590,11 @@ def sample_mart1_negatives(
     computed by `build_marts`; otherwise it's derived here via
     `revisit_match`.
 
-    Not yet wired into `build_marts`'s mart1 output - a later ticket
-    assembles this alongside the Next-Day Visit positives into Mart 1's full
-    historical training rows.
+    Wired into `build_mart1_training_set`, which assembles these Y=0 rows
+    alongside `_mart1_positive_samples`'s Next-Day Visit positives into
+    Mart 1's full historical training set (see that function) -- kept
+    separate from `build_marts`'s own mart1 output, which stays a single
+    as_of_date snapshot for daily inference/backtesting.
     """
     if chronic_customer_ids is None:
         chronic_customer_ids = _chronic_customer_ids(raw_visits)
@@ -478,6 +621,35 @@ def sample_mart1_negatives(
                     }
                 )
     return pd.DataFrame(rows, columns=MART1_NEGATIVE_SAMPLE_COLUMNS)
+
+
+def _mart1_positive_samples(raw_visits: pd.DataFrame, chronic_customer_ids: set) -> pd.DataFrame:
+    """One Next-Day Visit positive row per actual visit by a Chronic Patient
+    (see ADR-0001): snapshot_date = that visit's own 내방일 minus one day,
+    내일_방문 = True -- the literal observed instance of the customer walking
+    in on the calendar day right after the snapshot (see CONTEXT.md's Next-Day
+    Visit definition). Every visit contributes one positive this way,
+    including a customer's chronologically last visit -- unlike
+    `sample_mart1_negatives`, there's no cycle a positive needs a later visit
+    to bound.
+
+    Paired with `sample_mart1_negatives`'s Y=0 rows by
+    `build_mart1_training_set` to assemble Mart 1's full historical training
+    set. Same output shape (`MART1_NEGATIVE_SAMPLE_COLUMNS`) as
+    `sample_mart1_negatives` so the two concatenate directly.
+    """
+    visits = _one_row_per_visit(raw_visits, [CUSTOMER_ID_COL, VISIT_DATE_COL])
+    visits = visits[visits[CUSTOMER_ID_COL].isin(chronic_customer_ids)]
+    visit_dates = pd.to_datetime(visits[VISIT_DATE_COL])
+    return pd.DataFrame(
+        {
+            CUSTOMER_ID_COL: visits[CUSTOMER_ID_COL].to_numpy(),
+            VISIT_ID_COL: visits.index.to_numpy(),
+            SNAPSHOT_DATE_COL: (visit_dates - pd.Timedelta(days=1)).to_numpy(),
+            NEXT_DAY_VISIT_COL: True,
+        },
+        columns=MART1_NEGATIVE_SAMPLE_COLUMNS,
+    )
 
 
 def _build_mart1(
@@ -511,7 +683,11 @@ def _build_mart1(
             CHRONIC_COL: customers.isin(chronic_customer_ids),
         }
     )
-    return _attach_mart1_x_features(mart1, raw_visits, as_of_date)
+    mart1 = _attach_mart1_x_features(mart1, raw_visits, as_of_date)
+    mart1 = _attach_mart1_weight(
+        mart1, _visits_at_or_before(raw_visits, as_of_date), chronic_customer_ids
+    )
+    return mart1[MART1_COLUMNS]
 
 
 def _attach_mart1_x_features(
@@ -521,6 +697,11 @@ def _attach_mart1_x_features(
     as-of family loyalty, visit-timing/medication features anchored to each
     customer's most recent visit at or before `as_of_date`, and
     insurance/차상위 status. `mart1` must already have `고객ID`.
+
+    Returns `mart1` with these columns added, in no particular final order --
+    callers (`_build_mart1`, `build_mart1_training_set`) do their own final
+    column selection once every column (including 학습_가중치, attached
+    separately via `_attach_mart1_weight`) is in place.
     """
     customer_attrs = _customer_attrs_as_of(raw_visits, as_of_date)
     anchoring_visits = _anchoring_visit_features(raw_visits, as_of_date)
@@ -543,7 +724,27 @@ def _attach_mart1_x_features(
     mart1[NEAR_POVERTY_COL] = _eligibility_flag_mask(mart1[NEAR_POVERTY_COL])
     for col in MPR_NO_SHOW_FEATURE_COLS:
         mart1[col] = customer_ids.map(mpr_and_no_show[col])
-    return mart1[MART1_COLUMNS]
+    return mart1
+
+
+def _attach_mart1_weight(
+    mart1: pd.DataFrame, raw_visits: pd.DataFrame, chronic_customer_ids: set
+) -> pd.DataFrame:
+    """Joins in Mart 1's 학습_가중치 sample weight (see `sample_mart1_weights`).
+    `mart1` must already have `고객ID`.
+
+    `raw_visits` is whatever visit population the caller wants severity/
+    chronic tiers derived from: `_build_mart1` passes in the same
+    as-of-filtered visits its own `chronic_customer_ids` came from, keeping
+    `build_marts`'s snapshot fully point-in-time correct; `build_mart1_training_set`
+    passes in the full, unfiltered table, matching `sample_mart1_weights`'s
+    own live/full-history-by-default behavior when called directly (see its
+    docstring).
+    """
+    weights = sample_mart1_weights(raw_visits, chronic_customer_ids)
+    mart1 = mart1.copy()
+    mart1[WEIGHT_COL] = mart1[CUSTOMER_ID_COL].map(weights)
+    return mart1
 
 
 def _customer_attrs_as_of(raw_visits: pd.DataFrame, as_of_date: pd.Timestamp) -> pd.DataFrame:
