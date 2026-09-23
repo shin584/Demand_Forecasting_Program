@@ -7,8 +7,9 @@ This module currently implements the pipeline scaffolding, Mart 1's Y label,
 Revisit Match-based Chronic/Acute routing, Mart 1's sample-weight tiers,
 Mart 1's remaining X-features (demographics, as-of family loyalty,
 visit-timing/medication and insurance/차상위 features -- 가족_총매출 is
-permanently out of scope, see below), Mart 2's as-of-date consumption
-values, and as-of-date family visit totals; later tickets fill in Mart 3.
+permanently out of scope, see below -- plus MPR adherence score and
+per-patient no-show rate), Mart 2's as-of-date consumption values, and
+as-of-date family visit totals; later tickets fill in Mart 3.
 """
 
 from __future__ import annotations
@@ -46,6 +47,17 @@ NEAR_POVERTY_COL = "차상위대상자"
 MEDICATION_DAYS_COL = "투약일수"
 INGREDIENT_COL = "속명"
 
+# Mart 1 X-features added by issue #8: MPR adherence score and per-patient
+# no-show rate, both derived purely from a customer's own 조제판매ID history
+# (see CONTEXT.md's Mart 1 entry and docs/Research-Log.md's "복약 순응도 지표"
+# formula) rather than from any anchoring single visit. Travel together as a
+# pair everywhere (the constants below, MPR_NO_SHOW_FEATURE_COLS, and
+# MART1_COLUMNS), mirroring how ANCHORING_FEATURE_COLS groups its own
+# anchoring-visit features.
+MPR_COL = "복약_순응도"
+NO_SHOW_RATE_COL = "노쇼_비율"
+MPR_NO_SHOW_FEATURE_COLS = [MPR_COL, NO_SHOW_RATE_COL]
+
 # Severity/특례 eligibility flags (see CONTEXT.md "Severe/특례 Weight Tier").
 # 차상위대상자 is deliberately excluded here -- it's a copay-assistance
 # signal, not a severity signal, and belongs as an X-feature instead (see
@@ -75,6 +87,7 @@ MART1_COLUMNS = [
     PRIMARY_INGREDIENT_COL,
     INSURANCE_TYPE_COL,
     NEAR_POVERTY_COL,
+    *MPR_NO_SHOW_FEATURE_COLS,
 ]
 MART2_COLUMNS = [CUSTOMER_ID_COL, DRUG_ID_COL, MART2_VALUE_COL]
 MART3_COLUMNS = ["약품ID", "계절", "요일", "소모량"]
@@ -438,6 +451,7 @@ def _attach_mart1_x_features(
     family_visit_counts = family_totals_as_of(raw_visits, as_of_date).set_index(
         FAMILY_ID_COL
     )[FAMILY_VISIT_COUNT_COL]
+    mpr_and_no_show = _mpr_and_no_show_as_of(raw_visits, as_of_date)
 
     customer_ids = mart1[CUSTOMER_ID_COL]
     mart1 = mart1.copy()
@@ -451,6 +465,8 @@ def _attach_mart1_x_features(
     # 차상위대상자 is a raw 'Y'/blank eligibility flag (same source table and
     # convention as the severity flags) — normalize to boolean the same way.
     mart1[NEAR_POVERTY_COL] = _eligibility_flag_mask(mart1[NEAR_POVERTY_COL])
+    for col in MPR_NO_SHOW_FEATURE_COLS:
+        mart1[col] = customer_ids.map(mpr_and_no_show[col])
     return mart1[MART1_COLUMNS]
 
 
@@ -518,6 +534,14 @@ def _primary_drug_for_visit(visit_drugs: pd.DataFrame) -> pd.Series:
     return pd.Series({LONG_TERM_MED_DAYS_COL: pd.NA, PRIMARY_INGREDIENT_COL: pd.NA})
 
 
+def _empty_customer_frame(columns: list[str]) -> pd.DataFrame:
+    """An empty per-고객ID feature frame with the given columns -- the shared
+    empty-result shape for as-of feature builders (see
+    `_anchoring_visit_features` and `_mpr_and_no_show_as_of`) when no visit
+    is eligible at all as of `as_of_date`."""
+    return pd.DataFrame(columns=columns).set_index(pd.Index([], name=CUSTOMER_ID_COL))
+
+
 def _anchoring_visit_features(
     raw_visits: pd.DataFrame, as_of_date: pd.Timestamp
 ) -> pd.DataFrame:
@@ -541,9 +565,7 @@ def _anchoring_visit_features(
     visits = _visit_level_mart1_attrs(raw_visits).reset_index()
     eligible = visits[visits[VISIT_DATE_COL] <= as_of_date]
     if eligible.empty:
-        return pd.DataFrame(columns=ANCHORING_FEATURE_COLS).set_index(
-            pd.Index([], name=CUSTOMER_ID_COL)
-        )
+        return _empty_customer_frame(ANCHORING_FEATURE_COLS)
 
     anchoring = (
         eligible.sort_values(VISIT_DATE_COL, kind="stable")
@@ -567,6 +589,82 @@ def _anchoring_visit_features(
         as_of_date + pd.Timedelta(days=1) == anchoring[NEXT_EXPECTED_VISIT_COL]
     )
     return anchoring[ANCHORING_FEATURE_COLS]
+
+
+def _mpr_and_no_show_as_of(raw_visits: pd.DataFrame, as_of_date: pd.Timestamp) -> pd.DataFrame:
+    """Per 고객ID, the MPR adherence score (복약_순응도) and no-show rate
+    (노쇼_비율) computed purely from that customer's own visit history at or
+    before `as_of_date` (see CONTEXT.md's Mart 1 entry and issue #8).
+
+    Unlike `_anchoring_visit_features`, these aren't anchored to a single
+    visit -- they aggregate over every one of the customer's visits with
+    내방일 <= as_of_date.
+
+    Returns one row per 고객ID (an empty frame if no visits are eligible)
+    with columns MPR_NO_SHOW_FEATURE_COLS.
+    """
+    visits = _one_row_per_visit(
+        raw_visits,
+        [CUSTOMER_ID_COL, VISIT_DATE_COL, PRESCRIPTION_DAYS_COL, NEXT_EXPECTED_VISIT_COL],
+    ).reset_index()
+    eligible = visits[visits[VISIT_DATE_COL] <= as_of_date]
+    if eligible.empty:
+        return _empty_customer_frame(MPR_NO_SHOW_FEATURE_COLS)
+
+    return eligible.groupby(CUSTOMER_ID_COL, sort=False).apply(
+        lambda customer_visits: _mpr_and_no_show_for_customer(customer_visits, as_of_date),
+        include_groups=False,
+    )
+
+
+def _mpr_and_no_show_for_customer(
+    visits: pd.DataFrame, as_of_date: pd.Timestamp
+) -> pd.Series:
+    """MPR adherence score and no-show rate for one customer's eligible
+    (내방일 <= as_of_date) visit history.
+
+    MPR (복약_순응도), per docs/Research-Log.md's formula:
+        Sigma(처방조제일수) / (최종내방일 - 최초내방일 + 최종조제일수) x 100
+    복약_순응도 is NA whenever that denominator isn't a usable number --
+    either the last eligible visit's 처방조제일수 is itself missing, or the
+    denominator comes out to zero (a single eligible visit with
+    처방조제일수 == 0) -- rather than propagating a raw NaN or dividing by
+    zero.
+
+    노쇼_비율 (no-show rate): the proportion of this customer's 다음내방일
+    values that are themselves already resolvable as of `as_of_date` (i.e.
+    다음내방일 <= as_of_date -- a later 다음내방일 hasn't happened yet, so we
+    can't yet know whether it'll be kept) and that aren't matched by an
+    actual visit dated exactly on that 다음내방일. NA if none of this
+    customer's 다음내방일 values are resolvable yet -- there's no history to
+    compute a rate from, not evidence of a 0% or 100% rate.
+    """
+    ordered = visits.sort_values(VISIT_DATE_COL, kind="stable")
+    first_visit, last_visit = ordered.iloc[0], ordered.iloc[-1]
+    last_prescription_days = last_visit[PRESCRIPTION_DAYS_COL]
+    if pd.isna(last_prescription_days):
+        mpr = pd.NA
+    else:
+        denominator = (
+            last_visit[VISIT_DATE_COL] - first_visit[VISIT_DATE_COL]
+        ).days + last_prescription_days
+        mpr = (
+            ordered[PRESCRIPTION_DAYS_COL].sum() / denominator * 100
+            if denominator
+            else pd.NA
+        )
+
+    resolvable = ordered[NEXT_EXPECTED_VISIT_COL].notna() & (
+        ordered[NEXT_EXPECTED_VISIT_COL] <= as_of_date
+    )
+    if resolvable.any():
+        actual_visit_dates = set(ordered[VISIT_DATE_COL])
+        resolvable_next_dates = ordered.loc[resolvable, NEXT_EXPECTED_VISIT_COL]
+        no_show_rate = (~resolvable_next_dates.isin(actual_visit_dates)).mean()
+    else:
+        no_show_rate = pd.NA
+
+    return pd.Series({MPR_COL: mpr, NO_SHOW_RATE_COL: no_show_rate})
 
 
 def family_totals_as_of(raw_visits: pd.DataFrame, as_of_date) -> pd.DataFrame:

@@ -1,4 +1,5 @@
 import pandas as pd
+import pytest
 
 from conftest import make_high_frequency_filler_visits, make_raw_visits, make_visit_row
 from pipeline.marts import MART1_COLUMNS, MART2_COLUMNS, MART3_COLUMNS, build_marts
@@ -344,3 +345,124 @@ def test_mart1_family_visit_count_is_shared_and_as_of_date():
     counts = mart1.set_index("고객ID")["가족_총내방"]
     assert counts.loc[1] == expected
     assert counts.loc[2] == expected
+
+
+# Shared synthetic history for the MPR/no-show tests below (see issue #8):
+# customer 1 is Chronic via a Revisit Match between V1 and V2 (both carry
+# drug 1, and V2's 내방일 2024-02-05 falls within V1's 다음내방일 2024-01-31
+# +/-30 day window). V1's own 다음내방일 (2024-01-31) is never matched by an
+# actual visit on that exact day -- customer 1 comes back late, on
+# 2024-02-05 -- so it's a no-show; V2's 다음내방일 (2024-02-25) *is* matched
+# exactly by V3.
+def _mpr_no_show_history():
+    return [
+        make_visit_row(
+            조제판매ID=1,
+            고객ID=1,
+            내방일="2024-01-01",
+            다음내방일="2024-01-31",
+            처방조제일수=30,
+            약품ID=1,
+        ),
+        make_visit_row(
+            조제판매ID=2,
+            고객ID=1,
+            내방일="2024-02-05",
+            다음내방일="2024-02-25",
+            처방조제일수=20,
+            약품ID=1,
+        ),
+        make_visit_row(
+            조제판매ID=3,
+            고객ID=1,
+            내방일="2024-02-25",
+            다음내방일="2024-03-25",
+            처방조제일수=25,
+            약품ID=1,
+        ),
+    ]
+
+
+def test_mpr_adherence_score_matches_hand_computed_formula():
+    raw_visits = make_raw_visits(make_high_frequency_filler_visits(4) + _mpr_no_show_history())
+
+    mart1, _, _ = build_marts(raw_visits, as_of_date="2024-02-25")
+
+    # Sigma(처방조제일수) / (최종내방일 - 최초내방일 + 최종조제일수) x 100
+    # = (30 + 20 + 25) / ((2024-02-25 - 2024-01-01).days + 25) x 100
+    # = 75 / 80 x 100
+    expected_mpr = 75 / 80 * 100
+    assert mart1.set_index("고객ID")["복약_순응도"].loc[1] == pytest.approx(expected_mpr)
+
+
+def test_no_show_rate_matches_hand_computed_proportion():
+    raw_visits = make_raw_visits(make_high_frequency_filler_visits(4) + _mpr_no_show_history())
+
+    mart1, _, _ = build_marts(raw_visits, as_of_date="2024-02-25")
+
+    # Only V1's and V2's 다음내방일 are resolvable by 2024-02-25 (V3's is
+    # still in the future). V1's 다음내방일 (2024-01-31) has no matching
+    # actual visit -- a no-show. V2's (2024-02-25) is matched by V3.
+    # Rate = 1 no-show / 2 resolvable = 0.5.
+    assert mart1.set_index("고객ID")["노쇼_비율"].loc[1] == pytest.approx(0.5)
+
+
+def test_mpr_and_no_show_rate_have_no_leakage_from_later_visits():
+    raw_visits = make_raw_visits(make_high_frequency_filler_visits(4) + _mpr_no_show_history())
+
+    early = build_marts(raw_visits, as_of_date="2024-02-05").mart1.set_index("고객ID")
+    late = build_marts(raw_visits, as_of_date="2024-02-25").mart1.set_index("고객ID")
+
+    # At 2024-02-05, only V1 and V2 are known: MPR = 50 / (35 + 20) x 100,
+    # and V2's 다음내방일 (2024-02-25) can't be resolved yet, so only V1's
+    # (a no-show) counts -- rate = 1/1 = 1.0.
+    assert early["복약_순응도"].loc[1] == pytest.approx(50 / 55 * 100)
+    assert early["노쇼_비율"].loc[1] == pytest.approx(1.0)
+    # By 2024-02-25, V3 has resolved V2's 다음내방일 as a match, pulling the
+    # no-show rate down and the MPR up -- neither value leaked from V3 when
+    # it wasn't yet visible.
+    assert late["복약_순응도"].loc[1] == pytest.approx(75 / 80 * 100)
+    assert late["노쇼_비율"].loc[1] == pytest.approx(0.5)
+    assert early["복약_순응도"].loc[1] != late["복약_순응도"].loc[1]
+    assert early["노쇼_비율"].loc[1] != late["노쇼_비율"].loc[1]
+
+
+def test_no_show_rate_undefined_when_no_next_visit_date_has_resolved_yet():
+    raw_visits = make_raw_visits(
+        make_high_frequency_filler_visits()
+        + [
+            make_visit_row(
+                조제판매ID=1,
+                고객ID=1,
+                내방일="2024-01-01",
+                다음내방일="2024-01-31",
+                약품ID=1,
+            ),
+            make_visit_row(조제판매ID=2, 고객ID=1, 내방일="2024-01-05", 약품ID=1),
+        ]
+    )
+
+    mart1, _, _ = build_marts(raw_visits, as_of_date="2024-01-05")
+
+    assert pd.isna(mart1.set_index("고객ID")["노쇼_비율"].loc[1])
+
+
+def test_mpr_is_na_when_last_eligible_visits_prescription_days_is_missing():
+    raw_visits = make_raw_visits(
+        make_high_frequency_filler_visits()
+        + [
+            make_visit_row(
+                조제판매ID=1,
+                고객ID=1,
+                내방일="2024-01-01",
+                다음내방일="2024-01-31",
+                처방조제일수=None,
+                약품ID=1,
+            ),
+            make_visit_row(조제판매ID=2, 고객ID=1, 내방일="2024-02-05", 약품ID=1),
+        ]
+    )
+
+    mart1, _, _ = build_marts(raw_visits, as_of_date="2024-01-01")
+
+    assert pd.isna(mart1.set_index("고객ID")["복약_순응도"].loc[1])
