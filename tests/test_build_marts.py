@@ -1,7 +1,7 @@
 import pandas as pd
 
 from conftest import make_high_frequency_filler_visits, make_raw_visits, make_visit_row
-from pipeline.marts import MART2_COLUMNS, MART3_COLUMNS, build_marts
+from pipeline.marts import MART1_COLUMNS, MART2_COLUMNS, MART3_COLUMNS, build_marts
 
 
 def test_build_marts_returns_three_well_defined_marts():
@@ -13,7 +13,7 @@ def test_build_marts_returns_three_well_defined_marts():
     assert isinstance(mart1, pd.DataFrame)
     assert isinstance(mart2, pd.DataFrame)
     assert isinstance(mart3, pd.DataFrame)
-    assert list(mart1.columns) == ["고객ID", "내일_방문", "만성질환여부"]
+    assert list(mart1.columns) == MART1_COLUMNS
     assert list(mart2.columns) == MART2_COLUMNS
     assert list(mart3.columns) == MART3_COLUMNS
     # Named-tuple access works alongside positional unpacking.
@@ -173,3 +173,173 @@ def test_mart1_includes_only_chronic_patients_and_derives_chronic_flag():
 
     assert set(mart1["고객ID"]) == {1}
     assert mart1.set_index("고객ID")["만성질환여부"].loc[1] == True  # noqa: E712
+
+
+def test_mart1_does_not_include_department_or_a_substitute_column():
+    raw_visits = make_raw_visits([make_visit_row()])
+
+    mart1, _, _ = build_marts(raw_visits, as_of_date="2024-01-01")
+
+    assert "주요_진료과" not in mart1.columns
+    # 처방전발행기관ID is an opaque institution ID, not a department proxy
+    # (see CONTEXT.md's Mart 1 entry) -- it must not stand in either.
+    assert "처방전발행기관ID" not in mart1.columns
+
+
+def test_family_revenue_not_yet_available_pending_issue_10():
+    # 가족_총매출 (as-of) is not yet a Mart 1 column: the raw extract has no
+    # per-visit monetary amount to recompute it from point-in-time (see
+    # issue #10, which this ticket depends on for that one column).
+    raw_visits = make_raw_visits([make_visit_row()])
+
+    mart1, _, _ = build_marts(raw_visits, as_of_date="2024-01-01")
+
+    assert "가족_총매출" not in mart1.columns
+
+
+def test_primary_ingredient_matches_the_drug_with_longest_medication_days():
+    raw_visits = make_raw_visits(
+        make_high_frequency_filler_visits()
+        + [
+            # Same visit, two drugs -- 주요_약품속명/장기투약_일수 must follow
+            # whichever drug has the longer 투약일수 (drug 2), not row order.
+            make_visit_row(
+                조제판매ID=1,
+                고객ID=1,
+                내방일="2024-01-01",
+                다음내방일="2024-01-31",
+                약품ID=1,
+                투약일수=10,
+                속명="ingredientA",
+            ),
+            make_visit_row(
+                조제판매ID=1,
+                고객ID=1,
+                내방일="2024-01-01",
+                다음내방일="2024-01-31",
+                약품ID=2,
+                투약일수=30,
+                속명="ingredientB",
+            ),
+            # A later visit so customer 1 qualifies as Chronic (Revisit Match).
+            make_visit_row(조제판매ID=2, 고객ID=1, 내방일="2024-01-15", 약품ID=2),
+        ]
+    )
+
+    mart1, _, _ = build_marts(raw_visits, as_of_date="2024-01-01")
+
+    row = mart1.set_index("고객ID").loc[1]
+    assert row["주요_약품속명"] == "ingredientB"
+    assert row["장기투약_일수"] == 30
+
+
+def test_tomorrow_is_expected_visit_matches_as_of_date_plus_one_day():
+    raw_visits = make_raw_visits(
+        make_high_frequency_filler_visits()
+        + [
+            # Customer 1: anchoring visit's 다음내방일 is exactly as_of_date + 1.
+            make_visit_row(
+                조제판매ID=1, 고객ID=1, 내방일="2024-01-01", 다음내방일="2024-01-02", 약품ID=1
+            ),
+            make_visit_row(조제판매ID=2, 고객ID=1, 내방일="2024-01-10", 약품ID=1),
+            # Customer 2: anchoring visit's 다음내방일 is NOT as_of_date + 1.
+            make_visit_row(
+                조제판매ID=3, 고객ID=2, 내방일="2024-01-01", 다음내방일="2024-01-20", 약품ID=2
+            ),
+            make_visit_row(조제판매ID=4, 고객ID=2, 내방일="2024-01-15", 약품ID=2),
+        ]
+    )
+
+    mart1, _, _ = build_marts(raw_visits, as_of_date="2024-01-01")
+
+    flags = mart1.set_index("고객ID")["내일이_예약일"]
+    assert flags.loc[1] == True  # noqa: E712
+    assert flags.loc[2] == False  # noqa: E712
+
+
+def test_days_since_last_visit_and_remaining_medication_days():
+    raw_visits = make_raw_visits(
+        make_high_frequency_filler_visits()
+        + [
+            make_visit_row(
+                조제판매ID=1,
+                고객ID=1,
+                내방일="2024-01-01",
+                다음내방일="2024-01-31",
+                약품ID=1,
+                투약일수=20,
+            ),
+            # Later than the as_of_date used below -- must not anchor.
+            make_visit_row(조제판매ID=2, 고객ID=1, 내방일="2024-02-15", 약품ID=1),
+        ]
+    )
+
+    mart1, _, _ = build_marts(raw_visits, as_of_date="2024-01-11")
+
+    row = mart1.set_index("고객ID").loc[1]
+    assert row["마지막방문_경과일"] == 10
+    assert row["장기투약_일수"] == 20
+    assert row["남은_약_일수"] == 10
+
+
+def test_age_computed_as_of_date_accounts_for_birthday():
+    raw_visits = make_raw_visits(
+        make_high_frequency_filler_visits()
+        + [
+            make_visit_row(
+                조제판매ID=1,
+                고객ID=1,
+                생년월일="1990-06-15",
+                내방일="2024-01-01",
+                다음내방일="2024-01-31",
+                약품ID=1,
+            ),
+            make_visit_row(조제판매ID=2, 고객ID=1, 내방일="2024-02-10", 약품ID=1),
+        ]
+    )
+
+    before_birthday = build_marts(raw_visits, as_of_date="2024-03-01").mart1
+    after_birthday = build_marts(raw_visits, as_of_date="2024-07-01").mart1
+
+    assert before_birthday.set_index("고객ID")["나이"].loc[1] == 33
+    assert after_birthday.set_index("고객ID")["나이"].loc[1] == 34
+
+
+def test_mart1_family_visit_count_is_shared_and_as_of_date():
+    from pipeline.marts import family_totals_as_of
+
+    raw_visits = make_raw_visits(
+        make_high_frequency_filler_visits()
+        + [
+            # Family 1, two members (고객ID 1 and 2), sharing 가족ID=1.
+            make_visit_row(
+                조제판매ID=1,
+                고객ID=1,
+                가족ID=1,
+                내방일="2024-01-01",
+                다음내방일="2024-01-31",
+                약품ID=1,
+            ),
+            make_visit_row(조제판매ID=2, 고객ID=1, 가족ID=1, 내방일="2024-02-15", 약품ID=1),
+            make_visit_row(
+                조제판매ID=3,
+                고객ID=2,
+                가족ID=1,
+                내방일="2024-01-05",
+                다음내방일="2024-02-04",
+                약품ID=2,
+            ),
+            make_visit_row(조제판매ID=4, 고객ID=2, 가족ID=1, 내방일="2024-02-01", 약품ID=2),
+        ]
+    )
+
+    mart1, _, _ = build_marts(raw_visits, as_of_date="2024-01-10")
+
+    expected = (
+        family_totals_as_of(raw_visits, "2024-01-10")
+        .set_index("가족ID")["가족_총내방"]
+        .loc[1]
+    )
+    counts = mart1.set_index("고객ID")["가족_총내방"]
+    assert counts.loc[1] == expected
+    assert counts.loc[2] == expected

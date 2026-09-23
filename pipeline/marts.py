@@ -5,8 +5,10 @@ Mart 1 (Visit-Probability), Mart 2 (Customer Drug Profile) and Mart 3
 See CONTEXT.md and docs/adr/ for the design decisions this pipeline encodes.
 This module currently implements the pipeline scaffolding, Mart 1's Y label,
 Revisit Match-based Chronic/Acute routing, Mart 1's sample-weight tiers,
-Mart 2's as-of-date consumption values, and as-of-date family visit totals;
-later tickets fill in the remaining columns of all three marts.
+Mart 1's remaining X-features (demographics, as-of family loyalty,
+visit-timing/medication and insurance/차상위 features -- except 가족_총매출,
+still blocked on issue #10), Mart 2's as-of-date consumption values, and
+as-of-date family visit totals; later tickets fill in Mart 3.
 """
 
 from __future__ import annotations
@@ -30,6 +32,20 @@ MART2_VALUE_COL = "최근소모량"
 SNAPSHOT_DATE_COL = "기준일자"
 WEIGHT_COL = "학습_가중치"
 
+# Mart 1 X-features added by issue #7.
+BIRTH_DATE_COL = "생년월일"
+GENDER_COL = "성별"
+AGE_COL = "나이"
+DAYS_SINCE_LAST_VISIT_COL = "마지막방문_경과일"
+REMAINING_MED_DAYS_COL = "남은_약_일수"
+TOMORROW_IS_EXPECTED_VISIT_COL = "내일이_예약일"
+LONG_TERM_MED_DAYS_COL = "장기투약_일수"
+PRIMARY_INGREDIENT_COL = "주요_약품속명"
+INSURANCE_TYPE_COL = "보험구분"
+NEAR_POVERTY_COL = "차상위대상자"
+MEDICATION_DAYS_COL = "투약일수"
+INGREDIENT_COL = "속명"
+
 # Severity/특례 eligibility flags (see CONTEXT.md "Severe/특례 Weight Tier").
 # 차상위대상자 is deliberately excluded here -- it's a copay-assistance
 # signal, not a severity signal, and belongs as an X-feature instead (see
@@ -40,9 +56,40 @@ SEVERITY_FLAG_COLS = ["중증암등록대상자", "산전산모대상자", "희�
 _DRUG_SET_COL = "_drug_set"
 _CLEAN_DRUG_SET_COL = "_clean_drug_set"
 
-MART1_COLUMNS = [CUSTOMER_ID_COL, NEXT_DAY_VISIT_COL, CHRONIC_COL]
+# 가족_총매출 (as-of) is not yet included: the raw extract has no per-visit
+# monetary amount to recompute it from point-in-time (see issue #10, which
+# #7 depends on for this one column). Every other Mart 1 X-feature issue #7
+# calls for is here.
+MART1_COLUMNS = [
+    CUSTOMER_ID_COL,
+    NEXT_DAY_VISIT_COL,
+    CHRONIC_COL,
+    AGE_COL,
+    GENDER_COL,
+    FAMILY_VISIT_COUNT_COL,
+    DAYS_SINCE_LAST_VISIT_COL,
+    REMAINING_MED_DAYS_COL,
+    TOMORROW_IS_EXPECTED_VISIT_COL,
+    LONG_TERM_MED_DAYS_COL,
+    PRIMARY_INGREDIENT_COL,
+    INSURANCE_TYPE_COL,
+    NEAR_POVERTY_COL,
+]
 MART2_COLUMNS = [CUSTOMER_ID_COL, DRUG_ID_COL, MART2_VALUE_COL]
 MART3_COLUMNS = ["약품ID", "계절", "요일", "소모량"]
+
+# Mart 1's X-features anchored to each customer's most recent visit at or
+# before as_of_date (see _anchoring_visit_features) -- shared by that
+# function's output columns and _attach_mart1_x_features' join loop.
+ANCHORING_FEATURE_COLS = [
+    DAYS_SINCE_LAST_VISIT_COL,
+    REMAINING_MED_DAYS_COL,
+    TOMORROW_IS_EXPECTED_VISIT_COL,
+    LONG_TERM_MED_DAYS_COL,
+    PRIMARY_INGREDIENT_COL,
+    INSURANCE_TYPE_COL,
+    NEAR_POVERTY_COL,
+]
 
 # Revisit Match criterion H+T2 (see docs/adr/0001-chronic-patient-behavioral-definition.md).
 REVISIT_MATCH_WINDOW_DAYS = 30
@@ -148,10 +195,14 @@ def _visits_by_customer_ordered(visits: pd.DataFrame):
         yield group.sort_values(VISIT_DATE_COL, kind="stable")
 
 
-def _one_row_per_visit(raw_visits: pd.DataFrame, cols: list) -> pd.DataFrame:
-    """One row per 조제판매ID (a visit may dispense several drugs, one raw row
-    each), keeping the first value of each of `cols`."""
-    return raw_visits.groupby(VISIT_ID_COL, sort=False).agg(
+def _one_row_per_visit(
+    raw_visits: pd.DataFrame, cols: list, group_col: str = VISIT_ID_COL
+) -> pd.DataFrame:
+    """One row per `group_col` value (default 조제판매ID -- a visit may
+    dispense several drugs, one raw row each), keeping the first value of
+    each of `cols`. Pass `group_col=고객ID` for attributes that are constant
+    per customer instead (e.g. 성별/생년월일/가족ID)."""
+    return raw_visits.groupby(group_col, sort=False).agg(
         **{col: (col, "first") for col in cols}
     )
 
@@ -360,7 +411,7 @@ def _build_mart1(
     # day out.
     visited_next_day = set(raw_visits.loc[visit_dates == target_date, CUSTOMER_ID_COL])
 
-    return pd.DataFrame(
+    mart1 = pd.DataFrame(
         {
             CUSTOMER_ID_COL: customers,
             NEXT_DAY_VISIT_COL: customers.isin(visited_next_day),
@@ -370,6 +421,151 @@ def _build_mart1(
             CHRONIC_COL: customers.isin(chronic_customer_ids),
         }
     )
+    return _attach_mart1_x_features(mart1, raw_visits, as_of_date)
+
+
+def _attach_mart1_x_features(
+    mart1: pd.DataFrame, raw_visits: pd.DataFrame, as_of_date: pd.Timestamp
+) -> pd.DataFrame:
+    """Joins in Mart 1's remaining X-features (see issue #7): demographics,
+    as-of family loyalty, visit-timing/medication features anchored to each
+    customer's most recent visit at or before `as_of_date`, and
+    insurance/차상위 status. `mart1` must already have `고객ID`.
+    """
+    customer_attrs = _customer_attrs_as_of(raw_visits, as_of_date)
+    anchoring_visits = _anchoring_visit_features(raw_visits, as_of_date)
+    family_visit_counts = family_totals_as_of(raw_visits, as_of_date).set_index(
+        FAMILY_ID_COL
+    )[FAMILY_VISIT_COUNT_COL]
+
+    customer_ids = mart1[CUSTOMER_ID_COL]
+    mart1 = mart1.copy()
+    mart1[AGE_COL] = customer_ids.map(customer_attrs[AGE_COL])
+    mart1[GENDER_COL] = customer_ids.map(customer_attrs[GENDER_COL])
+    mart1[FAMILY_VISIT_COUNT_COL] = (
+        customer_ids.map(customer_attrs[FAMILY_ID_COL]).map(family_visit_counts)
+    )
+    for col in ANCHORING_FEATURE_COLS:
+        mart1[col] = customer_ids.map(anchoring_visits[col])
+    # 차상위대상자 is a raw 'Y'/blank eligibility flag (same source table and
+    # convention as the severity flags) — normalize to boolean the same way.
+    mart1[NEAR_POVERTY_COL] = _eligibility_flag_mask(mart1[NEAR_POVERTY_COL])
+    return mart1[MART1_COLUMNS]
+
+
+def _customer_attrs_as_of(raw_visits: pd.DataFrame, as_of_date: pd.Timestamp) -> pd.DataFrame:
+    """Per 고객ID demographic/family attributes that don't vary by visit:
+    성별, 나이 (computed as of `as_of_date` from 생년월일), and 가족ID (used
+    to look up that customer's as-of family visit total)."""
+    customers = _one_row_per_visit(
+        raw_visits,
+        [GENDER_COL, BIRTH_DATE_COL, FAMILY_ID_COL],
+        group_col=CUSTOMER_ID_COL,
+    )
+    customers[AGE_COL] = _age_in_years(
+        pd.to_datetime(customers[BIRTH_DATE_COL]), as_of_date
+    )
+    return customers
+
+
+def _age_in_years(birth_dates: pd.Series, as_of_date: pd.Timestamp) -> pd.Series:
+    """Whole-year age as of `as_of_date`, accounting for whether that year's
+    birthday has already passed."""
+    had_birthday_this_year = (birth_dates.dt.month < as_of_date.month) | (
+        (birth_dates.dt.month == as_of_date.month) & (birth_dates.dt.day <= as_of_date.day)
+    )
+    return (
+        as_of_date.year - birth_dates.dt.year - (~had_birthday_this_year).astype(int)
+    )
+
+
+def _visit_level_mart1_attrs(raw_visits: pd.DataFrame) -> pd.DataFrame:
+    """One row per 조제판매ID with the visit-level attributes Mart 1's
+    as-of features anchor to: customer identity, the visit's own 다음내방일,
+    insurance/차상위 status, and its primary drug (the drug with the
+    longest 투약일수 in that visit — the same drug 장기투약_일수 and
+    주요_약품속명 both name, see CONTEXT.md's Mart 1 entry)."""
+    visits = _one_row_per_visit(
+        raw_visits,
+        [
+            CUSTOMER_ID_COL,
+            VISIT_DATE_COL,
+            NEXT_EXPECTED_VISIT_COL,
+            INSURANCE_TYPE_COL,
+            NEAR_POVERTY_COL,
+        ],
+    )
+    primary_drug = raw_visits.groupby(VISIT_ID_COL, sort=False).apply(
+        _primary_drug_for_visit, include_groups=False
+    )
+    return visits.join(primary_drug)
+
+
+def _primary_drug_for_visit(visit_drugs: pd.DataFrame) -> pd.Series:
+    """Given one visit's drug rows, the 투약일수/속명 of whichever drug has
+    the longest 투약일수 -- undefined (NA) if every drug row is missing
+    투약일수."""
+    medication_days = pd.to_numeric(visit_drugs[MEDICATION_DAYS_COL], errors="coerce")
+    if medication_days.notna().any():
+        primary_row = medication_days.idxmax()
+        return pd.Series(
+            {
+                LONG_TERM_MED_DAYS_COL: medication_days.loc[primary_row],
+                PRIMARY_INGREDIENT_COL: visit_drugs.loc[primary_row, INGREDIENT_COL],
+            }
+        )
+    return pd.Series({LONG_TERM_MED_DAYS_COL: pd.NA, PRIMARY_INGREDIENT_COL: pd.NA})
+
+
+def _anchoring_visit_features(
+    raw_visits: pd.DataFrame, as_of_date: pd.Timestamp
+) -> pd.DataFrame:
+    """Per 고객ID, the visit-timing/medication/insurance features derived
+    from that customer's most recent visit at or before `as_of_date` (their
+    "anchoring visit").
+
+    Uses `<=` (a visit dated exactly `as_of_date` is eligible to anchor),
+    matching `_build_mart2`'s latest-consumption-value lookup -- this is
+    "what do we know as of this snapshot" for a point-feature, not a
+    cumulative count. That's a different question from `family_totals_as_of`
+    using strict `<`: a cumulative total must exclude the row's own visit to
+    avoid a visit counting itself (per docs/adr/0002-point-in-time-correctness.md,
+    "up to but excluding that visit"), but there's no equivalent
+    self-counting risk in picking which single visit anchors these features.
+
+    A customer with no visit at or before `as_of_date` has no anchoring
+    visit yet, so its features come back missing (NA) rather than computed
+    from a future visit.
+    """
+    visits = _visit_level_mart1_attrs(raw_visits).reset_index()
+    eligible = visits[visits[VISIT_DATE_COL] <= as_of_date]
+    if eligible.empty:
+        return pd.DataFrame(columns=ANCHORING_FEATURE_COLS).set_index(
+            pd.Index([], name=CUSTOMER_ID_COL)
+        )
+
+    anchoring = (
+        eligible.sort_values(VISIT_DATE_COL, kind="stable")
+        .groupby(CUSTOMER_ID_COL, as_index=True, sort=False)
+        .last()
+    )
+    anchoring[DAYS_SINCE_LAST_VISIT_COL] = (
+        as_of_date - anchoring[VISIT_DATE_COL]
+    ).dt.days
+    # 남은_약_일수: days left on the anchoring visit's longest-투약일수 drug
+    # (장기투약_일수) minus days elapsed since that visit. Issue #7 doesn't
+    # give an explicit formula ("days of medication remaining"), so this is
+    # an implementation judgment call, not a spec-given identity. Left
+    # unclamped by design -- a negative value means the patient is overdue
+    # for refill on that drug, which is itself a meaningful signal for
+    # Track 1's visit-probability model, not an error case to hide.
+    anchoring[REMAINING_MED_DAYS_COL] = (
+        anchoring[LONG_TERM_MED_DAYS_COL] - anchoring[DAYS_SINCE_LAST_VISIT_COL]
+    )
+    anchoring[TOMORROW_IS_EXPECTED_VISIT_COL] = (
+        as_of_date + pd.Timedelta(days=1) == anchoring[NEXT_EXPECTED_VISIT_COL]
+    )
+    return anchoring[ANCHORING_FEATURE_COLS]
 
 
 def family_totals_as_of(raw_visits: pd.DataFrame, as_of_date) -> pd.DataFrame:
