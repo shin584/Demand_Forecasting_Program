@@ -204,7 +204,11 @@ def test_chronic_classification_excludes_a_match_visit_after_as_of_date():
         ]
     )
 
-    result = build_marts(raw_visits, as_of_date="2024-01-01")
+    # rare_drug_patient_threshold=1 isolates this test's own concern (as-of
+    # Chronic/Acute routing) from Mart 3's separate rare-drug population
+    # filter (see test_mart3.py), which would otherwise exclude this
+    # single-patient drug regardless of its Chronic/Acute routing.
+    result = build_marts(raw_visits, as_of_date="2024-01-01", rare_drug_patient_threshold=1)
 
     assert 1 not in set(result.mart1["고객ID"])
     # Acute as of this snapshot, so its consumption routes into Mart 3
@@ -228,8 +232,12 @@ def test_chronic_classification_changes_across_snapshots_on_the_same_raw_dataset
         ]
     )
 
-    early = build_marts(raw_visits, as_of_date="2024-01-01")
-    late = build_marts(raw_visits, as_of_date="2024-02-15")
+    # rare_drug_patient_threshold=1 isolates this test's own concern (as-of
+    # Chronic/Acute routing) from Mart 3's separate rare-drug population
+    # filter (see test_mart3.py), which would otherwise exclude this
+    # single-patient drug regardless of its Chronic/Acute routing.
+    early = build_marts(raw_visits, as_of_date="2024-01-01", rare_drug_patient_threshold=1)
+    late = build_marts(raw_visits, as_of_date="2024-02-15", rare_drug_patient_threshold=1)
 
     assert 1 not in set(early.mart1["고객ID"])
     assert 1 in set(late.mart1["고객ID"])
