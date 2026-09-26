@@ -1166,20 +1166,19 @@ def resolve_mart3_backoff(
     return grid[MART3_COLUMNS]
 
 
-def _rare_drug_ids(
-    raw_visits: pd.DataFrame,
-    as_of_date: pd.Timestamp,
-    chronic_customer_ids: set,
-    rare_drug_patient_threshold: int,
+def _drug_ids_below_patient_threshold(
+    eligible: pd.DataFrame, as_of_date: pd.Timestamp, patient_threshold: int
 ) -> set:
-    """Drug IDs excluded from Mart 3 entirely (see docs/adr/0003-mart3-
-    population-and-backoff-thresholds.md): fewer than
-    `rare_drug_patient_threshold` distinct patients among that drug's
-    Acute-population visits -- `_mart3_eligible_visits`, the same population
-    `_mart3_observations` builds its grid from -- in the trailing 12 months
-    ending at `as_of_date` (visits with 내방일 > as_of_date - 12 calendar
-    months and <= as_of_date, matching `_visits_at_or_before`'s
-    inclusive-upper-bound convention).
+    """Shared rare-drug counting logic behind `_rare_drug_ids` (Mart 3's
+    Acute-scoped filter, see docs/adr/0003-mart3-population-and-backoff-
+    thresholds.md) and `chronic_rare_drug_ids` (Track 1's Chronic-scoped
+    counterpart, see docs/adr/0004-track1-rare-drug-population-and-
+    allocation.md): given a population's eligible visits (already restricted
+    to that population, to 내방일 <= `as_of_date`, and to a non-null 약품ID by
+    the caller), the drug IDs with fewer than `patient_threshold` distinct
+    patients in the trailing 12 months ending at `as_of_date` (visits with
+    내방일 > as_of_date - 12 calendar months and <= as_of_date, matching
+    `_visits_at_or_before`'s inclusive-upper-bound convention).
 
     As-of-date correct (see docs/adr/0002-point-in-time-correctness.md): a
     patient whose only qualifying visit falls after `as_of_date`, or before
@@ -1187,7 +1186,6 @@ def _rare_drug_ids(
     total. A drug at exactly the threshold is not excluded -- CONTEXT.md's
     rare-drug cutoff is strictly-less-than.
     """
-    eligible = _mart3_eligible_visits(raw_visits, as_of_date, chronic_customer_ids)
     if eligible.empty:
         return set()
 
@@ -1201,7 +1199,61 @@ def _rare_drug_ids(
         .nunique()
         .reindex(all_drug_ids, fill_value=0)
     )
-    return set(patient_counts.index[patient_counts < rare_drug_patient_threshold])
+    return set(patient_counts.index[patient_counts < patient_threshold])
+
+
+def _rare_drug_ids(
+    raw_visits: pd.DataFrame,
+    as_of_date: pd.Timestamp,
+    chronic_customer_ids: set,
+    rare_drug_patient_threshold: int,
+) -> set:
+    """Drug IDs excluded from Mart 3 entirely (see docs/adr/0003-mart3-
+    population-and-backoff-thresholds.md): fewer than
+    `rare_drug_patient_threshold` distinct patients among that drug's
+    Acute-population visits -- `_mart3_eligible_visits`, the same population
+    `_mart3_observations` builds its grid from (see
+    `_drug_ids_below_patient_threshold` for the counting methodology).
+    """
+    eligible = _mart3_eligible_visits(raw_visits, as_of_date, chronic_customer_ids)
+    return _drug_ids_below_patient_threshold(eligible, as_of_date, rare_drug_patient_threshold)
+
+
+def _track1_eligible_visits(
+    raw_visits: pd.DataFrame, as_of_date: pd.Timestamp, chronic_customer_ids: set
+) -> pd.DataFrame:
+    """Track 1's rare-drug population counterpart to `_mart3_eligible_visits`
+    (see docs/adr/0004-track1-rare-drug-population-and-allocation.md):
+    Chronic-Patient visits at or before `as_of_date` with a non-null 약품ID.
+    Used only by `chronic_rare_drug_ids` below -- Track 1's own expected-value
+    computation draws its population from Mart 1/Mart 2 instead, which are
+    already Chronic-only by construction (see `pipeline.inference`).
+    """
+    chronic_visits = raw_visits.loc[raw_visits[CUSTOMER_ID_COL].isin(chronic_customer_ids)]
+    return _visits_at_or_before(chronic_visits, as_of_date).dropna(subset=[DRUG_ID_COL])
+
+
+def chronic_rare_drug_ids(
+    raw_visits: pd.DataFrame,
+    as_of_date: pd.Timestamp,
+    chronic_customer_ids: set,
+    rare_drug_patient_threshold: int = RARE_DRUG_PATIENT_THRESHOLD,
+) -> set:
+    """Track 1's Chronic-population counterpart to `_rare_drug_ids` (see
+    docs/adr/0004-track1-rare-drug-population-and-allocation.md): drugs with
+    fewer than `rare_drug_patient_threshold` distinct Chronic patients --
+    not Mart 3's Acute population -- in the trailing 12 months ending at
+    `as_of_date` (see `_drug_ids_below_patient_threshold` for the shared
+    counting methodology). The two counts are independent: the same drug can
+    be "rare" under one and not the other, since Track 1 and Track 2 never
+    share a patient population.
+
+    Used by `pipeline.inference._track1_drug_demand` to switch a drug from
+    ordinary expected-value multiplication to the 100%-allocation sum rule
+    (see CONTEXT.md "Track 1 Rare-Drug Allocation").
+    """
+    eligible = _track1_eligible_visits(raw_visits, as_of_date, chronic_customer_ids)
+    return _drug_ids_below_patient_threshold(eligible, as_of_date, rare_drug_patient_threshold)
 
 
 def _build_mart3(

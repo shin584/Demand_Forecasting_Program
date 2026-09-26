@@ -1,17 +1,17 @@
 """Track 1 inference: scores every Chronic customer in a `build_marts`
 snapshot and produces the pharmacist Visit List plus Track 1's per-drug
-expected demand for ordinary (non-rare) drugs. Also combines that with
-Track 2's Mart 3 lookup into the final per-drug order-quantity table.
+expected demand -- ordinary expected-value multiplication for most drugs,
+the Chronic-population rare-drug allocation override for the rest. Also
+combines that with Track 2's Mart 3 lookup into the final per-drug
+order-quantity table.
 
 See CONTEXT.md ("Visit List", "Safety Stock", "Track 1 Rare-Drug
 Allocation") and docs/adr/0004-track1-rare-drug-population-and-allocation.md
 for the design this encodes. Issue #20 built `run_track1_inference`; issue
-#21 (this module's `run_daily_forecast`/`_combine_order_quantities`) adds
-Track 2's lookup and the combined table on top of its output. The
-Chronic-population rare-drug allocation override (issue #22) still applies
-the ordinary expected-value formula to every drug, including ones below the
-Chronic-population rare-drug cutoff -- that override slots into
-`run_track1_inference`/`_track1_drug_demand` separately.
+#21 (this module's `run_daily_forecast`/`_combine_order_quantities`) added
+Track 2's lookup and the combined table on top of its output; issue #22
+added the Chronic-population rare-drug allocation override into
+`_track1_drug_demand`, completing `run_daily_forecast`'s final behavior.
 """
 
 from __future__ import annotations
@@ -33,6 +33,7 @@ from .marts import (
     SNAPSHOT_DATE_COL,
     WEEKDAY_COL,
     build_marts,
+    chronic_rare_drug_ids,
     season_and_weekday_for,
 )
 from .model import CHRONIC_VISIT_PROB_CUTOFF, prepare_track1_features
@@ -78,6 +79,7 @@ def run_track1_inference(
     as_of_date,
     model,
     chronic_visit_prob_cutoff: float = CHRONIC_VISIT_PROB_CUTOFF,
+    rare_drug_patient_threshold: int = RARE_DRUG_PATIENT_THRESHOLD,
 ) -> Track1Result:
     """Scores every Chronic customer in `build_marts`'s Mart 1 snapshot for
     `as_of_date` and returns the pharmacist Visit List alongside Track 1's
@@ -97,14 +99,17 @@ def run_track1_inference(
     `drug_demand` (`TRACK1_DEMAND_COLUMNS`: 기준일자, 약품ID, track1_기댓값) is
     the ordinary expected-value formula -- probability x Mart 2 latest
     consumption, summed per drug across every Chronic customer who has a
-    Mart 2 row for it -- applied here to every drug, since the
-    Chronic-population rare-drug override (docs/adr/0004) isn't implemented
-    yet (see issue #22, which replaces this per-drug for drugs below that
-    cutoff). Every customer contributes via the expected-value formula
-    regardless of `chronic_visit_prob_cutoff` -- that cutoff only gates the
-    Visit List, not this sum, since expected value already scales a
-    low-probability customer's contribution down rather than needing a hard
-    cutoff.
+    Mart 2 row for it -- for most drugs. A drug with fewer than
+    `rare_drug_patient_threshold` distinct Chronic patients (trailing 12
+    months, see `pipeline.marts.chronic_rare_drug_ids`) instead uses the
+    100%-allocation rule: the sum of each qualifying customer's full latest
+    Mart 2 consumption, "qualifying" meaning predicted probability
+    `>= chronic_visit_prob_cutoff` (see CONTEXT.md "Track 1 Rare-Drug
+    Allocation" and docs/adr/0004). Every ordinary-drug customer contributes
+    via the expected-value formula regardless of `chronic_visit_prob_cutoff`
+    -- that cutoff only gates the Visit List and the rare-drug rule, not the
+    ordinary sum, since expected value already scales a low-probability
+    customer's contribution down rather than needing a hard cutoff.
     """
     as_of_date = pd.Timestamp(as_of_date)
     mart1, mart2, _mart3 = build_marts(raw_visits, as_of_date)
@@ -114,7 +119,15 @@ def run_track1_inference(
     visit_list = _build_visit_list(
         mart1[CUSTOMER_ID_COL], probabilities, as_of_date, chronic_visit_prob_cutoff
     )
-    drug_demand = _track1_drug_demand(mart1[CUSTOMER_ID_COL], probabilities, mart2, as_of_date)
+    drug_demand = _track1_drug_demand(
+        mart1[CUSTOMER_ID_COL],
+        probabilities,
+        mart2,
+        raw_visits,
+        as_of_date,
+        chronic_visit_prob_cutoff,
+        rare_drug_patient_threshold,
+    )
     return Track1Result(visit_list=visit_list, drug_demand=drug_demand)
 
 
@@ -146,24 +159,51 @@ def _track1_drug_demand(
     customer_ids: pd.Series,
     probabilities: pd.Series,
     mart2: pd.DataFrame,
+    raw_visits: pd.DataFrame,
     as_of_date: pd.Timestamp,
+    chronic_visit_prob_cutoff: float,
+    rare_drug_patient_threshold: int,
 ) -> pd.DataFrame:
-    """Track 1's ordinary per-drug expected demand (see CONTEXT.md "Track 1
-    Rare-Drug Allocation"): probability x Mart 2 latest consumption, summed
-    per drug.
+    """Track 1's per-drug expected demand, summed per drug across every
+    Chronic customer who has a Mart 2 row for it (see CONTEXT.md "Track 1
+    Rare-Drug Allocation").
+
+    Most drugs use the ordinary expected-value formula: probability x Mart 2
+    latest consumption. A drug with fewer than `rare_drug_patient_threshold`
+    distinct Chronic patients in the trailing 12 months (see
+    `pipeline.marts.chronic_rare_drug_ids`) uses the 100%-allocation rule
+    instead: the sum of each qualifying customer's full latest Mart 2
+    consumption, where qualifying means predicted probability
+    `>= chronic_visit_prob_cutoff` -- a customer below that cutoff
+    contributes 0, not a scaled-down amount, and ordinary expected-value
+    multiplication is never applied to a drug once it's below the threshold.
 
     `mart2` covers every customer (Chronic and Acute alike, per
     `build_marts`), but only Chronic customers -- the ones in `customer_ids`,
     Mart 1's own population -- have a predicted probability at all; an Acute
-    customer's Mart 2 row maps to no probability and is dropped below, so
-    only Chronic consumption ever contributes here.
+    customer's Mart 2 row maps to no probability (NaN) and is dropped below
+    either way, so only Chronic consumption ever contributes here.
     """
+    chronic_customer_ids = set(customer_ids)
+    rare_drug_ids = chronic_rare_drug_ids(
+        raw_visits, as_of_date, chronic_customer_ids, rare_drug_patient_threshold
+    )
+
     probability_by_customer = pd.Series(probabilities.to_numpy(), index=customer_ids.to_numpy())
     matched_probability = mart2[CUSTOMER_ID_COL].map(probability_by_customer)
-    expected_demand = matched_probability * mart2[MART2_VALUE_COL]
+    is_rare_drug = mart2[DRUG_ID_COL].isin(rare_drug_ids)
+
+    ordinary_demand = matched_probability * mart2[MART2_VALUE_COL]
+    # NaN (rather than 0.0) below cutoff -- dropped by the dropna below, the
+    # same "doesn't contribute at all" treatment an Acute customer's NaN
+    # probability already gets, rather than a separate zero-value row.
+    rare_allocation = mart2[MART2_VALUE_COL].where(
+        matched_probability >= chronic_visit_prob_cutoff
+    )
+    per_row_demand = rare_allocation.where(is_rare_drug, ordinary_demand)
 
     demand = (
-        pd.DataFrame({DRUG_ID_COL: mart2[DRUG_ID_COL], TRACK1_DEMAND_COL: expected_demand})
+        pd.DataFrame({DRUG_ID_COL: mart2[DRUG_ID_COL], TRACK1_DEMAND_COL: per_row_demand})
         .dropna(subset=[TRACK1_DEMAND_COL])
         .groupby(DRUG_ID_COL, as_index=False)[TRACK1_DEMAND_COL]
         .sum()
@@ -186,11 +226,15 @@ def run_daily_forecast(
     (`run_track1_inference`) combined with Track 2's Mart 3 lookup into the
     final per-drug order-quantity table.
 
-    `mart3_bucket_min_observations`/`mart3_season_min_observations`/
-    `rare_drug_patient_threshold` are forwarded to `build_marts` for Mart 3
-    (see that function) -- they don't affect Track 1's own Mart 1/Mart 2-based
-    computation, which `run_track1_inference` still derives via its own
-    (default-threshold) `build_marts` call.
+    `mart3_bucket_min_observations`/`mart3_season_min_observations` are
+    forwarded to `build_marts` for Mart 3 only (see that function) -- they
+    don't affect Track 1's own Mart 1/Mart 2-based computation, which
+    `run_track1_inference` still derives via its own (default-threshold)
+    `build_marts` call. `rare_drug_patient_threshold` is forwarded to both:
+    Mart 3's Acute-population rare-drug filter and Track 1's own
+    Chronic-population rare-drug allocation override (see CONTEXT.md
+    "Decision Thresholds (provisional)" and docs/adr/0004) -- one shared
+    threshold *value*, applied independently to each track's own population.
 
     `order_quantities` (`ORDER_QUANTITY_COLUMNS`: 기준일자, 약품ID, 약품명,
     track1_기댓값, track2_통계값, 최종발주량) is the union of every drug
@@ -199,7 +243,9 @@ def run_daily_forecast(
     `safety_stock_buffer` (see CONTEXT.md "Safety Stock").
     """
     as_of_date = pd.Timestamp(as_of_date)
-    track1 = run_track1_inference(raw_visits, as_of_date, model, chronic_visit_prob_cutoff)
+    track1 = run_track1_inference(
+        raw_visits, as_of_date, model, chronic_visit_prob_cutoff, rare_drug_patient_threshold
+    )
     _mart1, _mart2, mart3 = build_marts(
         raw_visits,
         as_of_date,

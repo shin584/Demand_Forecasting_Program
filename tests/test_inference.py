@@ -71,6 +71,33 @@ def _two_chronic_customers_with_drug_consumption(
     )
 
 
+def _n_chronic_customers_with_drug_consumption(
+    as_of_date: str, drug_id: int, consumptions: list[float]
+) -> pd.DataFrame:
+    """`len(consumptions)` independently-established Chronic customers (see
+    ADR-0001), each with one additional dated `as_of_date` visit consuming
+    `drug_id` at their own consumption amount -- Mart 2's input for that
+    drug. Generalizes `_two_chronic_customers_with_drug_consumption` to an
+    arbitrary customer count, needed to straddle the Chronic-population
+    rare-drug threshold (see docs/adr/0004-track1-rare-drug-population-and-
+    allocation.md and issue #22)."""
+    rows = make_high_frequency_filler_visits()
+    for i, consumption in enumerate(consumptions, start=1):
+        rows += make_independent_chronic_match_visits(
+            customer_id=i, drug_id=1000 + i, visit_id_start=10 * i
+        )
+        rows.append(
+            make_visit_row(
+                조제판매ID=1000 + i,
+                고객ID=i,
+                내방일=as_of_date,
+                약품ID=drug_id,
+                소모량=consumption,
+            )
+        )
+    return make_raw_visits(rows)
+
+
 def test_scores_every_chronic_customer_with_no_prefiltering():
     raw_visits = _two_chronic_customers_with_drug_consumption(
         "2024-01-01", drug_id=501, consumption_1=40.0, consumption_2=20.0
@@ -144,8 +171,16 @@ def test_track1_drug_demand_is_probability_weighted_consumption_summed_per_drug(
     )
     model = StubModel([0.2, 0.8])
 
+    # rare_drug_patient_threshold=1: only 2 Chronic patients ever touch drug
+    # 501 in this fixture, so the default threshold (5) would otherwise route
+    # this drug into the rare-drug allocation rule (issue #22) instead of the
+    # ordinary formula this test exercises.
     result = run_track1_inference(
-        raw_visits, as_of_date="2024-01-01", model=model, chronic_visit_prob_cutoff=0.3
+        raw_visits,
+        as_of_date="2024-01-01",
+        model=model,
+        chronic_visit_prob_cutoff=0.3,
+        rare_drug_patient_threshold=1,
     )
 
     demand = result.drug_demand.set_index(DRUG_ID_COL)[TRACK1_DEMAND_COL]
@@ -153,6 +188,69 @@ def test_track1_drug_demand_is_probability_weighted_consumption_summed_per_drug(
     # either one's individual cutoff standing (see Research-Log.md's
     # "방문 확률이 있는 모든 고객의 기댓값을 약품별로 합산").
     assert demand.loc[501] == 24.0
+
+
+# --- Chronic-population rare-drug allocation override (issue #22, see
+# docs/adr/0004-track1-rare-drug-population-and-allocation.md). ---
+
+
+def test_rare_drug_allocation_sums_qualifying_customers_full_consumption():
+    raw_visits = _n_chronic_customers_with_drug_consumption(
+        "2024-01-01", drug_id=501, consumptions=[40.0, 20.0, 10.0]
+    )
+    # 3 Chronic patients ever touch drug 501 -- below the default rare-drug
+    # threshold of 5 (see docs/adr/0004), so the 100%-allocation rule applies
+    # instead of ordinary probability-weighted multiplication.
+    model = StubModel([0.1, 0.5, 0.9])  # only customers 2 and 3 clear 0.3
+
+    result = run_track1_inference(
+        raw_visits, as_of_date="2024-01-01", model=model, chronic_visit_prob_cutoff=0.3
+    )
+
+    demand = result.drug_demand.set_index(DRUG_ID_COL)[TRACK1_DEMAND_COL]
+    # Full latest consumption summed for qualifying customers 2 (20.0) and 3
+    # (10.0) only -- customer 1 (below cutoff) contributes 0, not a scaled
+    # amount, and the qualifying values are summed (30.0), not averaged
+    # (15.0) or maxed (20.0).
+    assert demand.loc[501] == 30.0
+
+
+def test_rare_drug_allocation_never_applies_probability_weighting():
+    raw_visits = _n_chronic_customers_with_drug_consumption(
+        "2024-01-01", drug_id=501, consumptions=[40.0, 20.0, 10.0]
+    )
+    model = StubModel([0.31, 0.9, 0.9])  # all three clear the cutoff
+
+    result = run_track1_inference(
+        raw_visits, as_of_date="2024-01-01", model=model, chronic_visit_prob_cutoff=0.3
+    )
+
+    demand = result.drug_demand.set_index(DRUG_ID_COL)[TRACK1_DEMAND_COL]
+    # If ordinary expected-value multiplication were (wrongly) still applied,
+    # this would come out to 0.31*40 + 0.9*20 + 0.9*10 = 39.4, not 70.0 --
+    # the full, unweighted sum across every qualifying customer.
+    assert demand.loc[501] == 70.0
+
+
+def test_drug_at_exactly_the_rare_drug_threshold_uses_ordinary_expected_value():
+    raw_visits = _n_chronic_customers_with_drug_consumption(
+        "2024-01-01", drug_id=501, consumptions=[40.0, 20.0, 10.0]
+    )
+    model = StubModel([0.2, 0.5, 0.9])
+
+    result = run_track1_inference(
+        raw_visits,
+        as_of_date="2024-01-01",
+        model=model,
+        chronic_visit_prob_cutoff=0.3,
+        rare_drug_patient_threshold=3,  # exactly 3 patients -- not below 3
+    )
+
+    demand = result.drug_demand.set_index(DRUG_ID_COL)[TRACK1_DEMAND_COL]
+    # Ordinary expected-value formula: 0.2*40 + 0.5*20 + 0.9*10 = 27.0 --
+    # CONTEXT.md's rare-drug cutoff is strictly-less-than, so a drug at
+    # exactly the threshold is not rare.
+    assert demand.loc[501] == pytest.approx(27.0)
 
 
 def test_track1_drug_demand_excludes_acute_customers_entirely():
@@ -268,8 +366,16 @@ def test_drug_with_only_a_track1_contribution_has_zero_track2_estimate():
     )
     model = StubModel([0.2, 0.8])
 
+    # rare_drug_patient_threshold=1: only 2 Chronic patients ever touch drug
+    # 501 in this fixture, so the default threshold (5) would otherwise route
+    # this drug into the rare-drug allocation rule (issue #22) instead of the
+    # ordinary formula this test exercises.
     result = run_daily_forecast(
-        raw_visits, as_of_date="2024-01-01", model=model, chronic_visit_prob_cutoff=0.3
+        raw_visits,
+        as_of_date="2024-01-01",
+        model=model,
+        chronic_visit_prob_cutoff=0.3,
+        rare_drug_patient_threshold=1,
     )
 
     order = result.order_quantities.set_index(DRUG_ID_COL)
