@@ -115,14 +115,26 @@ def train_track1_model(
     return TrainedTrack1Model(model=model, metrics=metrics)
 
 
+def prepare_track1_features(mart1_rows: pd.DataFrame) -> pd.DataFrame:
+    """LightGBM-ready X-features (`FEATURE_COLS`, with `CATEGORICAL_FEATURE_COLS`
+    as native pandas `category` dtype) from any `MART1_COLUMNS`-shaped frame.
+
+    Shared by `_features_target_weight` (training) and Track 1 inference
+    (`pipeline.inference`), so a Mart 1 row becomes a model input the same way
+    in both places and the two can never drift out of sync.
+    """
+    features = mart1_rows[FEATURE_COLS].copy()
+    for col in CATEGORICAL_FEATURE_COLS:
+        features[col] = features[col].astype("category")
+    return features
+
+
 def _features_target_weight(mart1_rows: pd.DataFrame) -> _Mart1Features:
     """`mart1_rows` (Mart 1 training-set/`MART1_COLUMNS`-shaped rows) split
     into LightGBM-ready X-features (categorical columns as native `category`
     dtype), the `내일_방문` target as 0/1, and the `학습_가중치` sample
     weight."""
-    features = mart1_rows[FEATURE_COLS].copy()
-    for col in CATEGORICAL_FEATURE_COLS:
-        features[col] = features[col].astype("category")
+    features = prepare_track1_features(mart1_rows)
     target = mart1_rows[NEXT_DAY_VISIT_COL].astype(int)
     weight = mart1_rows[WEIGHT_COL]
     return _Mart1Features(features=features, target=target, weight=weight)

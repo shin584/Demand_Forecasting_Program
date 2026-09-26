@@ -22,9 +22,8 @@ from pipeline.marts import (
     WEIGHT_COL,
 )
 from pipeline.model import (
-    CATEGORICAL_FEATURE_COLS,
-    FEATURE_COLS,
     load_track1_model,
+    prepare_track1_features,
     save_track1_model,
     train_track1_model,
 )
@@ -70,17 +69,6 @@ def _train_val():
     train = _make_mart1_training_frame(300, seed=1)
     val = _make_mart1_training_frame(100, seed=2)
     return train, val
-
-
-def _categorical_features(mart1_rows: pd.DataFrame) -> pd.DataFrame:
-    """Test-local mirror of train_track1_model's own categorical-dtype
-    conversion, built only from public FEATURE_COLS/CATEGORICAL_FEATURE_COLS
-    -- so tests can build LightGBM-ready X-features for direct predict_proba
-    calls without reaching into any private helper."""
-    features = mart1_rows[FEATURE_COLS].copy()
-    for col in CATEGORICAL_FEATURE_COLS:
-        features[col] = features[col].astype("category")
-    return features
 
 
 def test_returns_model_and_metrics_with_expected_keys_in_range():
@@ -185,7 +173,7 @@ def test_sample_weight_is_threaded_into_training():
     model_heavy_true = train_track1_model(heavy_true, val).model
     model_heavy_false = train_track1_model(heavy_false, val).model
 
-    vector_row = _categorical_features(pd.DataFrame([_fixed_feature_vector()]))
+    vector_row = prepare_track1_features(pd.DataFrame([_fixed_feature_vector()]))
     proba_heavy_true = model_heavy_true.predict_proba(vector_row)[0, 1]
     proba_heavy_false = model_heavy_false.predict_proba(vector_row)[0, 1]
 
@@ -200,7 +188,7 @@ def test_model_persists_and_reloads_to_an_equivalent_usable_model(tmp_path):
     save_track1_model(result.model, model_path)
     reloaded = load_track1_model(model_path)
 
-    X_val = _categorical_features(val)
+    X_val = prepare_track1_features(val)
     original_proba = result.model.predict_proba(X_val)[:, 1]
     reloaded_proba = reloaded.predict_proba(X_val)[:, 1]
     np.testing.assert_allclose(original_proba, reloaded_proba)
