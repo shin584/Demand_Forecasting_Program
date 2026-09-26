@@ -31,6 +31,7 @@ from pipeline.backtest import (
 )
 from pipeline.marts import (
     DRUG_ID_COL,
+    SNAPSHOT_DATE_COL,
     build_mart1_training_set,
     split_mart1_training_set,
 )
@@ -54,21 +55,29 @@ def _load_raw_visits(path: Path) -> pd.DataFrame:
     return raw_visits
 
 
+def _wape_breakdown(daily: pd.DataFrame, group_col: str) -> pd.DataFrame:
+    """Same WAPE formula as `pipeline.backtest._summarize`
+    (`sum(abs error) / sum(actual)`), grouped by `group_col` instead of taken
+    once over the whole window -- see issue #18's Implementation Decisions
+    ("WAPE formula ... computed both per as-of-date and once overall")."""
+    breakdown = daily.groupby(group_col)[[PREDICTED_COL, ACTUAL_COL, ERROR_COL]].sum()
+    breakdown["WAPE"] = breakdown[ERROR_COL] / breakdown[ACTUAL_COL].replace(0, pd.NA)
+    return breakdown
+
+
 def _write_report(path: Path, result) -> None:
-    per_drug = (
-        result.daily.groupby(DRUG_ID_COL)[[PREDICTED_COL, ACTUAL_COL, ERROR_COL]]
-        .sum()
-        .sort_values(ERROR_COL, ascending=False)
-    )
-    per_drug["WAPE"] = per_drug[ERROR_COL] / per_drug[ACTUAL_COL].replace(0, pd.NA)
+    per_date = _wape_breakdown(result.daily, SNAPSHOT_DATE_COL)
+    per_drug = _wape_breakdown(result.daily, DRUG_ID_COL).sort_values(ERROR_COL, ascending=False)
 
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         f.write(f"WAPE: {result.summary.wape:.4f}\n")
         f.write(f"Total predicted: {result.summary.total_predicted:.2f}\n")
         f.write(f"Total actual: {result.summary.total_actual:.2f}\n")
-        f.write(f"Days: {result.daily['기준일자'].nunique()}\n\n")
-        f.write("Per-drug breakdown (sorted by absolute error, descending):\n")
+        f.write(f"Days: {len(per_date)}\n\n")
+        f.write("Per-as-of-date WAPE:\n")
+        f.write(per_date.to_string())
+        f.write("\n\nPer-drug breakdown (sorted by absolute error, descending):\n")
         f.write(per_drug.to_string())
         f.write("\n")
 
@@ -92,7 +101,7 @@ def main() -> None:
 
     test_dates = None
     if args.test_dates_limit is not None:
-        test = split.test["기준일자"]
+        test = split.test[SNAPSHOT_DATE_COL]
         full_range = pd.date_range(test.min(), test.max(), freq="D")
         test_dates = list(full_range[: args.test_dates_limit])
 
