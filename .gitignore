@@ -7,3 +7,7 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# Trained Track 1 model artifact (see pipeline/model.py) -- a regenerable
+# build output, not source.
+/pipeline/artifacts/

@@ -106,6 +106,11 @@ MART1_COLUMNS = [
     *MPR_NO_SHOW_FEATURE_COLS,
     WEIGHT_COL,
 ]
+# MART1_COLUMNS entries that are an identifier, the Y label, the sample
+# weight, or the Chronic-only-population constant -- never a model X-feature.
+# Shared by `build_mart1_training_set` (below) and `pipeline.model.FEATURE_COLS`.
+MART1_NON_FEATURE_COLS = (CUSTOMER_ID_COL, NEXT_DAY_VISIT_COL, CHRONIC_COL, WEIGHT_COL)
+
 MART2_COLUMNS = [CUSTOMER_ID_COL, DRUG_ID_COL, MART2_VALUE_COL]
 SEASON_COL = "계절"
 WEEKDAY_COL = "요일"
@@ -320,11 +325,7 @@ def build_mart1_training_set(raw_visits: pd.DataFrame) -> pd.DataFrame:
     result[CHRONIC_COL] = True
     # Derived solely from Revisit Match, same as _build_mart1 -- every row
     # here is already restricted to chronic_customer_ids.
-    feature_cols = [
-        col
-        for col in MART1_COLUMNS
-        if col not in (CUSTOMER_ID_COL, NEXT_DAY_VISIT_COL, CHRONIC_COL, WEIGHT_COL)
-    ]
+    feature_cols = [col for col in MART1_COLUMNS if col not in MART1_NON_FEATURE_COLS]
     for col in feature_cols:
         result[col] = pd.NA
 
