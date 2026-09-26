@@ -15,6 +15,7 @@ from pipeline.marts import (
     WEEKDAY_COL,
     build_marts,
     resolve_mart3_backoff,
+    season_and_weekday_for,
 )
 
 
@@ -393,6 +394,13 @@ def test_mart3_rare_drug_filter_respects_as_of_date():
     ).mart3
 
     assert 1 not in set(mart3[DRUG_ID_COL])
+
+
+def test_season_and_weekday_for_matches_the_grid_axes():
+    # 2024-01-15 is a Monday in January -- 겨울/월요일, matching the same
+    # month->season and weekday->name mappings the grid itself is built from.
+    assert season_and_weekday_for("2024-01-15") == ("겨울", "월요일")
+    assert season_and_weekday_for("2024-07-04") == ("여름", "목요일")
 
 
 def test_mart3_rare_drug_filter_excludes_patients_outside_trailing_12_months():

@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+import pytest
 
 from conftest import (
     make_high_frequency_filler_visits,
@@ -8,13 +9,18 @@ from conftest import (
     make_visit_row,
 )
 from pipeline.inference import (
+    FINAL_ORDER_COL,
+    ORDER_QUANTITY_COLUMNS,
+    SAFETY_STOCK_BUFFER,
     TRACK1_DEMAND_COL,
     TRACK1_DEMAND_COLUMNS,
+    TRACK2_STAT_COL,
     VISIT_LIST_COLUMNS,
     VISIT_PROB_COL,
+    run_daily_forecast,
     run_track1_inference,
 )
-from pipeline.marts import CUSTOMER_ID_COL, DRUG_ID_COL, SNAPSHOT_DATE_COL
+from pipeline.marts import CUSTOMER_ID_COL, DRUG_ID_COL, DRUG_NAME_COL, SNAPSHOT_DATE_COL
 
 
 class StubModel:
@@ -201,3 +207,148 @@ def test_default_cutoff_matches_chronic_visit_prob_cutoff():
     result = run_track1_inference(raw_visits, as_of_date="2024-01-01", model=model)
 
     assert list(result.visit_list[CUSTOMER_ID_COL]) == [2]
+
+
+# --- run_daily_forecast: combines Track 1's drug demand with Track 2's Mart
+# 3 lookup into the final order-quantity table (issue #21). ---
+
+
+def _acute_observation_visits(drug_id: int, visit_date: str, consumption: float) -> pd.DataFrame:
+    """Filler visits (so no real drug gets swept into the Revisit Match
+    top-2 exclusion) plus a single Acute customer's (no revisit match)
+    observation of `drug_id` -- Mart 3's input for that drug."""
+    return make_raw_visits(
+        make_high_frequency_filler_visits()
+        + [
+            make_visit_row(
+                조제판매ID=1, 고객ID=1, 내방일=visit_date, 약품ID=drug_id, 소모량=consumption
+            )
+        ]
+    )
+
+
+def test_order_quantities_columns_and_snapshot_date():
+    raw_visits = _two_chronic_customers_with_drug_consumption(
+        "2024-01-01", drug_id=501, consumption_1=40.0, consumption_2=20.0
+    )
+    model = StubModel([0.2, 0.8])
+
+    result = run_daily_forecast(
+        raw_visits, as_of_date="2024-01-01", model=model, chronic_visit_prob_cutoff=0.3
+    )
+
+    assert list(result.order_quantities.columns) == ORDER_QUANTITY_COLUMNS
+    assert (result.order_quantities[SNAPSHOT_DATE_COL] == pd.Timestamp("2024-01-01")).all()
+
+
+def test_drug_with_only_a_track2_contribution_has_zero_track1_demand():
+    # A single Acute customer (no Chronic customers at all) observed on a
+    # Monday in January -- 겨울/월요일, the target date's own bucket below.
+    raw_visits = _acute_observation_visits(drug_id=501, visit_date="2024-01-08", consumption=42.0)
+    model = StubModel([])  # no Chronic customers to score
+
+    result = run_daily_forecast(
+        raw_visits,
+        as_of_date="2024-01-14",  # target date 2024-01-15 is also a Monday
+        model=model,
+        rare_drug_patient_threshold=1,
+        mart3_bucket_min_observations=1,
+    )
+
+    order = result.order_quantities.set_index(DRUG_ID_COL)
+    assert order.loc[501, TRACK1_DEMAND_COL] == 0.0
+    assert order.loc[501, TRACK2_STAT_COL] == 42.0
+
+
+def test_drug_with_only_a_track1_contribution_has_zero_track2_estimate():
+    # 약품ID=501 here is only ever consumed by Chronic customers, so it never
+    # enters Mart 3's Acute-only population at all.
+    raw_visits = _two_chronic_customers_with_drug_consumption(
+        "2024-01-01", drug_id=501, consumption_1=40.0, consumption_2=20.0
+    )
+    model = StubModel([0.2, 0.8])
+
+    result = run_daily_forecast(
+        raw_visits, as_of_date="2024-01-01", model=model, chronic_visit_prob_cutoff=0.3
+    )
+
+    order = result.order_quantities.set_index(DRUG_ID_COL)
+    assert order.loc[501, TRACK1_DEMAND_COL] == 24.0  # 0.2*40 + 0.8*20
+    assert order.loc[501, TRACK2_STAT_COL] == 0.0
+
+
+def test_final_order_quantity_is_buffered_sum_of_both_tracks():
+    raw_visits = make_raw_visits(
+        make_high_frequency_filler_visits()
+        + make_independent_chronic_match_visits(customer_id=1, drug_id=101, visit_id_start=10)
+        + make_independent_chronic_match_visits(customer_id=2, drug_id=102, visit_id_start=12)
+        + [
+            make_visit_row(
+                조제판매ID=100, 고객ID=1, 내방일="2024-01-14", 약품ID=501, 소모량=40.0
+            ),
+            make_visit_row(
+                조제판매ID=101, 고객ID=2, 내방일="2024-01-14", 약품ID=501, 소모량=20.0
+            ),
+            # Acute customer (no revisit match) buys the same drug, landing
+            # in the target date's own 겨울/월요일 bucket.
+            make_visit_row(
+                조제판매ID=102, 고객ID=3, 내방일="2024-01-08", 약품ID=501, 소모량=42.0
+            ),
+        ]
+    )
+    model = StubModel([0.2, 0.8])
+
+    result = run_daily_forecast(
+        raw_visits,
+        as_of_date="2024-01-14",
+        model=model,
+        chronic_visit_prob_cutoff=0.3,
+        rare_drug_patient_threshold=1,
+        mart3_bucket_min_observations=1,
+        safety_stock_buffer=2.0,
+    )
+
+    order = result.order_quantities.set_index(DRUG_ID_COL)
+    track1_value = order.loc[501, TRACK1_DEMAND_COL]
+    track2_value = order.loc[501, TRACK2_STAT_COL]
+    assert track1_value == 24.0  # 0.2*40 + 0.8*20
+    assert track2_value == 42.0
+    assert order.loc[501, FINAL_ORDER_COL] == pytest.approx((track1_value + track2_value) * 2.0)
+
+
+def test_default_safety_stock_buffer_is_1_2():
+    assert SAFETY_STOCK_BUFFER == 1.2
+
+
+def test_drug_name_resolved_from_raw_visits():
+    raw_visits = _acute_observation_visits(drug_id=501, visit_date="2024-01-08", consumption=42.0)
+    raw_visits.loc[raw_visits[DRUG_ID_COL] == 501, DRUG_NAME_COL] = "감기약"
+    model = StubModel([])
+
+    result = run_daily_forecast(
+        raw_visits,
+        as_of_date="2024-01-14",
+        model=model,
+        rare_drug_patient_threshold=1,
+        mart3_bucket_min_observations=1,
+    )
+
+    order = result.order_quantities.set_index(DRUG_ID_COL)
+    assert order.loc[501, DRUG_NAME_COL] == "감기약"
+
+
+def test_visit_list_is_passed_through_unchanged():
+    raw_visits = _two_chronic_customers_with_drug_consumption(
+        "2024-01-01", drug_id=501, consumption_1=40.0, consumption_2=20.0
+    )
+    model = StubModel([0.2, 0.8])
+
+    track1 = run_track1_inference(
+        raw_visits, as_of_date="2024-01-01", model=model, chronic_visit_prob_cutoff=0.3
+    )
+    model = StubModel([0.2, 0.8])
+    result = run_daily_forecast(
+        raw_visits, as_of_date="2024-01-01", model=model, chronic_visit_prob_cutoff=0.3
+    )
+
+    pd.testing.assert_frame_equal(result.visit_list, track1.visit_list)

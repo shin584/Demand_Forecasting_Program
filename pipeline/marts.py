@@ -36,6 +36,7 @@ NEXT_EXPECTED_VISIT_COL = "다음내방일"
 PRESCRIPTION_DAYS_COL = "처방조제일수"
 FAMILY_ID_COL = "가족ID"
 DRUG_ID_COL = "약품ID"
+DRUG_NAME_COL = "약품명"
 CONSUMPTION_COL = "소모량"
 NEXT_DAY_VISIT_COL = "내일_방문"
 CHRONIC_COL = "만성질환여부"
@@ -1036,6 +1037,16 @@ def _seasons_for(dates: pd.Series) -> pd.Series:
 def _weekdays_for(dates: pd.Series) -> pd.Series:
     """Each date's 요일 (Korean weekday name), per `MART3_WEEKDAYS`."""
     return dates.dt.dayofweek.map(_WEEKDAY_INDEX_TO_NAME)
+
+
+def season_and_weekday_for(date) -> tuple[str, str]:
+    """The (계절, 요일) pair for a single date, via the same derivation
+    `_seasons_for`/`_weekdays_for` use for Mart 3's grid axes -- exposed so a
+    caller with just one date (Track 2's target-date lookup, see
+    `pipeline.inference`) doesn't need to wrap it in a one-row DataFrame to
+    reuse that derivation."""
+    date = pd.Timestamp(date)
+    return _MONTH_TO_SEASON[date.month], _WEEKDAY_INDEX_TO_NAME[date.dayofweek]
 
 
 def _mart3_eligible_visits(
