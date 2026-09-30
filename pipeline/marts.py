@@ -27,6 +27,7 @@ from __future__ import annotations
 
 from typing import NamedTuple
 
+import numpy as np
 import pandas as pd
 
 CUSTOMER_ID_COL = "고객ID"
@@ -111,6 +112,21 @@ MART1_COLUMNS = [
 # weight, or the Chronic-only-population constant -- never a model X-feature.
 # Shared by `build_mart1_training_set` (below) and `pipeline.model.FEATURE_COLS`.
 MART1_NON_FEATURE_COLS = (CUSTOMER_ID_COL, NEXT_DAY_VISIT_COL, CHRONIC_COL, WEIGHT_COL)
+
+# Mart 1 X-features `_mart1_x_features` pins to float64 / nullable `boolean`
+# dtype -- LightGBM rejects object-dtype numeric columns at fit and predict
+# time. 주요_약품속명/보험구분/성별 are deliberately left out:
+# `pipeline.model.CATEGORICAL_FEATURE_COLS` casts those to pandas `category`
+# dtype instead.
+MART1_NUMERIC_FEATURE_COLS = [
+    AGE_COL,
+    FAMILY_VISIT_COUNT_COL,
+    DAYS_SINCE_LAST_VISIT_COL,
+    REMAINING_MED_DAYS_COL,
+    LONG_TERM_MED_DAYS_COL,
+    *MPR_NO_SHOW_FEATURE_COLS,
+]
+MART1_BOOLEAN_FEATURE_COLS = [TOMORROW_IS_EXPECTED_VISIT_COL, NEAR_POVERTY_COL]
 
 MART2_COLUMNS = [CUSTOMER_ID_COL, DRUG_ID_COL, MART2_VALUE_COL]
 SEASON_COL = "계절"
@@ -292,14 +308,9 @@ def build_mart1_training_set(raw_visits: pd.DataFrame) -> pd.DataFrame:
     a per-row leakage-sensitive X-feature. Only the point, anchoring,
     family-total, and MPR/no-show X-features -- the ones point-in-time
     correctness actually protects (see CONTEXT.md "Point-in-Time
-    Correctness") -- are recomputed per row's own snapshot date, via the same
-    as-of-date helpers `build_marts` uses.
-
-    Materially more expensive than `build_marts`: X-features are recomputed
-    once per distinct historical snapshot date present in the assembled rows
-    (via a groupby), not once for a single date, which is the trade-off
-    accepted for a correct historical training set over `build_marts`'s
-    cheaper single-snapshot use case.
+    Correctness") -- are computed as of each row's own snapshot date, by the
+    same `_mart1_x_features` `build_marts` uses, in one vectorized pass over
+    every row rather than once per distinct snapshot date.
 
     Returns an empty `MART1_TRAINING_COLUMNS`-shaped frame if `raw_visits`
     has no Chronic Patients at all.
@@ -316,28 +327,12 @@ def build_mart1_training_set(raw_visits: pd.DataFrame) -> pd.DataFrame:
         ignore_index=True,
     )
 
-    # Filled in place, one snapshot_date group at a time, below -- rather
-    # than building a small mart1 frame per group and pd.concat-ing them,
-    # which triggers pandas' "concatenation with empty or all-NA entries"
-    # FutureWarning whenever a group's X-features come back entirely NA
-    # (e.g. a customer with no anchoring visit yet at their earliest
-    # snapshot date, see _attach_mart1_x_features).
-    result = samples.copy()
-    result[CHRONIC_COL] = True
+    result = samples.join(
+        _mart1_x_features(raw_visits, samples[CUSTOMER_ID_COL], samples[SNAPSHOT_DATE_COL])
+    )
     # Derived solely from Revisit Match, same as _build_mart1 -- every row
     # here is already restricted to chronic_customer_ids.
-    feature_cols = [col for col in MART1_COLUMNS if col not in MART1_NON_FEATURE_COLS]
-    for col in feature_cols:
-        result[col] = pd.NA
-
-    for snapshot_date, group in samples.groupby(SNAPSHOT_DATE_COL, sort=False):
-        features = _attach_mart1_x_features(
-            group[[CUSTOMER_ID_COL, NEXT_DAY_VISIT_COL]].assign(**{CHRONIC_COL: True}),
-            raw_visits,
-            snapshot_date,
-        )
-        result.loc[features.index, feature_cols] = features[feature_cols]
-
+    result[CHRONIC_COL] = True
     result = _attach_mart1_weight(result, raw_visits, chronic_customer_ids)
     return result[MART1_TRAINING_COLUMNS]
 
@@ -390,37 +385,108 @@ def revisit_match(raw_visits: pd.DataFrame) -> pd.Series:
     near-universal OTC drugs - within +/-30 days of this visit's 다음내방일
     (expected next-visit date).
     """
-    visits = _visits_with_drug_sets(raw_visits)
-    excluded_drug_ids = _top_frequent_drug_ids(raw_visits, TOP_FREQUENT_DRUG_EXCLUDE_COUNT)
-    visits[_CLEAN_DRUG_SET_COL] = visits[_DRUG_SET_COL].apply(
-        lambda drugs: drugs - excluded_drug_ids
-    )
-
-    is_match = pd.Series(False, index=visits.index)
-    for ordered in _visits_by_customer_ordered(visits):
-        records = ordered.to_dict("records")
-        row_positions = ordered.index.to_list()
-
-        for i, current in enumerate(records):
-            window_start = current[NEXT_EXPECTED_VISIT_COL] - pd.Timedelta(
-                days=REVISIT_MATCH_WINDOW_DAYS
-            )
-            window_end = current[NEXT_EXPECTED_VISIT_COL] + pd.Timedelta(
-                days=REVISIT_MATCH_WINDOW_DAYS
-            )
-
-            for later in records[i + 1 :]:
-                if later[VISIT_DATE_COL] <= current[VISIT_DATE_COL]:
-                    continue
-                if not (window_start <= later[VISIT_DATE_COL] <= window_end):
-                    continue
-                if current[_CLEAN_DRUG_SET_COL] & later[_CLEAN_DRUG_SET_COL]:
-                    is_match.loc[row_positions[i]] = True
-                    break
-
-    is_match.index = visits[VISIT_ID_COL]
+    visit_ids = _one_row_per_visit(raw_visits, [CUSTOMER_ID_COL]).index
+    matched_visit_ids = _matched_drug_rows(raw_visits)[VISIT_ID_COL]
+    is_match = pd.Series(visit_ids.isin(matched_visit_ids), index=visit_ids)
     is_match.index.name = VISIT_ID_COL
     return is_match
+
+
+def _matched_drug_rows(raw_visits: pd.DataFrame) -> pd.DataFrame:
+    """The distinct (조제판매ID, 약품ID) rows that make their visit a Revisit
+    Match (see `revisit_match`), with each visit's 고객ID alongside.
+
+    Vectorized rather than comparing every pair of a customer's visits: for
+    each (visit, drug) row, the only later visit worth checking is the
+    earliest one by the same customer dispensing the same drug on or after
+    max(내방일 + 1 day, 다음내방일 - 30 days) -- if that one isn't within
+    다음내방일 + 30 days, no later one is either. Found with one sorted
+    as-of lookup per bound (see `_as_of_positions`).
+    """
+    visits = _one_row_per_visit(
+        raw_visits, [CUSTOMER_ID_COL, VISIT_DATE_COL, NEXT_EXPECTED_VISIT_COL]
+    )
+    # A shared drug only counts if it's outside the top-N most frequent -- the
+    # same drug sits on both sides of a match, so dropping those rows up front
+    # removes them from both.
+    excluded_drug_ids = _top_frequent_drug_ids(raw_visits, TOP_FREQUENT_DRUG_EXCLUDE_COUNT)
+    drug_rows = raw_visits[[VISIT_ID_COL, DRUG_ID_COL]].dropna().drop_duplicates()
+    drug_rows = (
+        drug_rows[~drug_rows[DRUG_ID_COL].isin(excluded_drug_ids)]
+        .join(visits, on=VISIT_ID_COL)
+        .reset_index(drop=True)
+    )
+    visit_dates = pd.to_datetime(drug_rows[VISIT_DATE_COL])
+    next_dates = pd.to_datetime(drug_rows[NEXT_EXPECTED_VISIT_COL])
+    window = pd.Timedelta(days=REVISIT_MATCH_WINDOW_DAYS)
+
+    candidates = drug_rows.assign(**{VISIT_DATE_COL: visit_dates})
+    candidates = candidates[visit_dates.notna()].sort_values(
+        [CUSTOMER_ID_COL, DRUG_ID_COL, VISIT_DATE_COL], kind="stable"
+    )
+    candidate_groups = pd.MultiIndex.from_frame(candidates[[CUSTOMER_ID_COL, DRUG_ID_COL]])
+    query_groups = pd.MultiIndex.from_frame(drug_rows[[CUSTOMER_ID_COL, DRUG_ID_COL]])
+    candidate_dates = candidates[VISIT_DATE_COL]
+
+    def positions(query_dates, side):
+        return _as_of_positions(
+            candidate_groups, candidate_dates, query_groups, query_dates, side
+        )[1]
+
+    # First candidate strictly later than this visit, first candidate inside
+    # the window's lower bound, and one past the last inside its upper bound.
+    after_visit = positions(visit_dates, "right")
+    in_window_from = positions(next_dates - window, "left")
+    in_window_to = positions(next_dates + window, "right")
+    first_candidate = np.maximum(after_visit, in_window_from)
+
+    matched = (
+        visit_dates.notna().to_numpy()
+        & next_dates.notna().to_numpy()
+        & (first_candidate < in_window_to)
+    )
+    return drug_rows.loc[matched, [VISIT_ID_COL, DRUG_ID_COL, CUSTOMER_ID_COL]]
+
+
+def _as_of_positions(
+    table_groups: pd.Index,
+    table_times: pd.Series,
+    query_groups: pd.Index,
+    query_times,
+    side: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Vectorized per-group as-of lookup, the shared engine behind every
+    "what's knowable as of this snapshot date" feature (see
+    docs/adr/0002-point-in-time-correctness.md) when many (group, date)
+    queries must be answered at once.
+
+    `table_groups`/`table_times` must already be sorted by (group, time),
+    with no NaT times. For each query (group, time), returns (start, end)
+    row positions into that table such that rows start..end-1 are exactly
+    that group's rows with time <= the query time (`side="right"`) or
+    strictly < it (`side="left"`). A group absent from the table, or a
+    NaT query time, gets an empty range (start == end).
+    """
+    group_index = table_groups.unique()
+    table_codes = group_index.get_indexer(table_groups).astype(np.int64)
+    query_codes = group_index.get_indexer(query_groups).astype(np.int64)
+
+    table_ns = pd.to_datetime(pd.Series(table_times)).to_numpy("datetime64[ns]").view(np.int64)
+    query_datetimes = pd.to_datetime(pd.Series(query_times))
+    query_ns = query_datetimes.to_numpy("datetime64[ns]").view(np.int64)
+    valid = (query_codes >= 0) & query_datetimes.notna().to_numpy()
+
+    # Rank-compress every time involved so (group, time) packs into one
+    # sortable int64 key without any assumption about time resolution.
+    all_times = np.unique(np.concatenate([table_ns, query_ns[valid]]))
+    width = len(all_times) + 1
+    table_keys = table_codes * width + np.searchsorted(all_times, table_ns)
+    query_base = np.where(valid, query_codes, 0) * width
+    query_keys = query_base + np.searchsorted(all_times, query_ns)
+
+    start = np.searchsorted(table_keys, query_base, side="left")
+    end = np.searchsorted(table_keys, query_keys, side=side)
+    return np.where(valid, start, 0), np.where(valid, end, 0)
 
 
 def _visits_at_or_before(raw_visits: pd.DataFrame, as_of_date: pd.Timestamp) -> pd.DataFrame:
@@ -434,14 +500,6 @@ def _visits_at_or_before(raw_visits: pd.DataFrame, as_of_date: pd.Timestamp) -> 
     return raw_visits.loc[visit_dates <= as_of_date]
 
 
-def _visits_by_customer_ordered(visits: pd.DataFrame):
-    """Yield each customer's visits (one group per 고객ID), sorted
-    chronologically by 내방일 (stable, so same-day visits keep their
-    original relative order)."""
-    for _, group in visits.groupby(CUSTOMER_ID_COL, sort=False):
-        yield group.sort_values(VISIT_DATE_COL, kind="stable")
-
-
 def _one_row_per_visit(
     raw_visits: pd.DataFrame, cols: list, group_col: str = VISIT_ID_COL
 ) -> pd.DataFrame:
@@ -452,16 +510,6 @@ def _one_row_per_visit(
     return raw_visits.groupby(group_col, sort=False).agg(
         **{col: (col, "first") for col in cols}
     )
-
-
-def _visits_with_drug_sets(raw_visits: pd.DataFrame) -> pd.DataFrame:
-    visits = _one_row_per_visit(
-        raw_visits, [CUSTOMER_ID_COL, VISIT_DATE_COL, NEXT_EXPECTED_VISIT_COL]
-    )
-    visits[_DRUG_SET_COL] = raw_visits.groupby(VISIT_ID_COL, sort=False)[DRUG_ID_COL].agg(
-        lambda drug_ids: frozenset(drug_ids.dropna())
-    )
-    return visits.reset_index()
 
 
 def _top_frequent_drug_ids(raw_visits: pd.DataFrame, top_n: int) -> set:
@@ -490,12 +538,7 @@ def _chronic_customer_ids(raw_visits: pd.DataFrame) -> set:
     """
     if raw_visits.empty:
         return set()
-    matches = revisit_match(raw_visits)
-    matched_visit_ids = matches[matches].index
-    visit_customers = _visits_with_drug_sets(raw_visits).set_index(VISIT_ID_COL)[
-        CUSTOMER_ID_COL
-    ]
-    return set(visit_customers.loc[matched_visit_ids])
+    return set(_matched_drug_rows(raw_visits)[CUSTOMER_ID_COL])
 
 
 def sample_mart1_weights(
@@ -631,24 +674,48 @@ def sample_mart1_negatives(
 
     visits = _one_row_per_visit(
         raw_visits, [CUSTOMER_ID_COL, VISIT_DATE_COL, PRESCRIPTION_DAYS_COL]
-    )
+    ).reset_index()
     visits = visits[visits[CUSTOMER_ID_COL].isin(chronic_customer_ids)]
 
-    rows = []
-    for ordered in _visits_by_customer_ordered(visits):
-        for visit_id, visit in ordered.iloc[:-1].iterrows():
-            for snapshot_date in negative_sample_dates(
-                visit[VISIT_DATE_COL], visit[PRESCRIPTION_DAYS_COL]
-            ):
-                rows.append(
-                    {
-                        CUSTOMER_ID_COL: visit[CUSTOMER_ID_COL],
-                        VISIT_ID_COL: visit_id,
-                        SNAPSHOT_DATE_COL: snapshot_date,
-                        NEXT_DAY_VISIT_COL: False,
-                    }
-                )
-    return pd.DataFrame(rows, columns=MART1_NEGATIVE_SAMPLE_COLUMNS)
+    # Customers in first-appearance order, each customer's visits
+    # chronological (stable, so same-day visits keep their relative order),
+    # minus that customer's last visit.
+    visits = visits.assign(_customer_order=pd.factorize(visits[CUSTOMER_ID_COL])[0])
+    visits = visits.sort_values(["_customer_order", VISIT_DATE_COL], kind="stable")
+    anchors = visits[visits.duplicated(CUSTOMER_ID_COL, keep="last")].reset_index(drop=True)
+
+    # negative_sample_offsets, vectorized: np.rint rounds half-to-even exactly
+    # like the built-in round() it uses.
+    offsets = np.maximum(
+        1,
+        np.rint(
+            np.outer(
+                anchors[PRESCRIPTION_DAYS_COL].to_numpy(dtype=float),
+                NEGATIVE_SAMPLE_FRACTIONS,
+            )
+        ),
+    )
+    samples = (
+        pd.DataFrame(offsets)
+        .stack()
+        .rename("_offset")
+        .reset_index(level=1, drop=True)
+        .rename_axis("_anchor")
+        .reset_index()
+        .drop_duplicates()
+        .sort_values(["_anchor", "_offset"], kind="stable")
+    )
+    anchor_rows = anchors.loc[samples["_anchor"]].reset_index(drop=True)
+    return pd.DataFrame(
+        {
+            CUSTOMER_ID_COL: anchor_rows[CUSTOMER_ID_COL],
+            VISIT_ID_COL: anchor_rows[VISIT_ID_COL],
+            SNAPSHOT_DATE_COL: pd.to_datetime(anchor_rows[VISIT_DATE_COL])
+            + pd.to_timedelta(samples["_offset"].to_numpy(), unit="D"),
+            NEXT_DAY_VISIT_COL: False,
+        },
+        columns=MART1_NEGATIVE_SAMPLE_COLUMNS,
+    )
 
 
 def _mart1_positive_samples(raw_visits: pd.DataFrame, chronic_customer_ids: set) -> pd.DataFrame:
@@ -711,48 +778,280 @@ def _build_mart1(
             CHRONIC_COL: customers.isin(chronic_customer_ids),
         }
     )
-    mart1 = _attach_mart1_x_features(mart1, raw_visits, as_of_date)
+    mart1 = mart1.join(
+        _mart1_x_features(raw_visits, customers, pd.Series(as_of_date, index=customers.index))
+    )
     mart1 = _attach_mart1_weight(
         mart1, _visits_at_or_before(raw_visits, as_of_date), chronic_customer_ids
     )
     return mart1[MART1_COLUMNS]
 
 
-def _attach_mart1_x_features(
-    mart1: pd.DataFrame, raw_visits: pd.DataFrame, as_of_date: pd.Timestamp
+def _mart1_x_features(
+    raw_visits: pd.DataFrame, customer_ids: pd.Series, snapshot_dates: pd.Series
 ) -> pd.DataFrame:
-    """Joins in Mart 1's remaining X-features (see issue #7): demographics,
-    as-of family loyalty, visit-timing/medication features anchored to each
-    customer's most recent visit at or before `as_of_date`, and
-    insurance/차상위 status. `mart1` must already have `고객ID`.
+    """Mart 1's X-features (see issue #7/#8) for each (고객ID, snapshot date)
+    pair -- `customer_ids` and `snapshot_dates` are aligned Series, and the
+    result shares their index. Every feature is point-in-time correct as of
+    its own row's snapshot date (see docs/adr/0002-point-in-time-correctness.md):
+    demographics, as-of family loyalty, visit-timing/medication and
+    insurance/차상위 features anchored to the customer's most recent visit at
+    or before that date, and the MPR/no-show history aggregates.
 
-    Returns `mart1` with these columns added, in no particular final order --
-    callers (`_build_mart1`, `build_mart1_training_set`) do their own final
-    column selection once every column (including 학습_가중치, attached
-    separately via `_attach_mart1_weight`) is in place.
+    One vectorized pass regardless of how many distinct snapshot dates the
+    rows span, so `build_marts` (one date) and `build_mart1_training_set`
+    (thousands) share the exact same feature definitions. Numeric features
+    come back float64 and boolean ones as nullable `boolean` -- the dtypes
+    LightGBM accepts (see MART1_NUMERIC_FEATURE_COLS/MART1_BOOLEAN_FEATURE_COLS).
     """
-    customer_attrs = _customer_attrs_as_of(raw_visits, as_of_date)
-    anchoring_visits = _anchoring_visit_features(raw_visits, as_of_date)
-    family_visit_counts = family_totals_as_of(raw_visits, as_of_date).set_index(
-        FAMILY_ID_COL
-    )[FAMILY_VISIT_COUNT_COL]
-    mpr_and_no_show = _mpr_and_no_show_as_of(raw_visits, as_of_date)
+    snapshot_dates = pd.to_datetime(snapshot_dates)
+    visits = _visit_table(raw_visits)
+    features = pd.DataFrame(index=customer_ids.index)
 
-    customer_ids = mart1[CUSTOMER_ID_COL]
-    mart1 = mart1.copy()
-    mart1[AGE_COL] = customer_ids.map(customer_attrs[AGE_COL])
-    mart1[GENDER_COL] = customer_ids.map(customer_attrs[GENDER_COL])
-    mart1[FAMILY_VISIT_COUNT_COL] = (
-        customer_ids.map(customer_attrs[FAMILY_ID_COL]).map(family_visit_counts)
+    customers = _one_row_per_visit(
+        raw_visits, [GENDER_COL, BIRTH_DATE_COL, FAMILY_ID_COL], group_col=CUSTOMER_ID_COL
     )
-    for col in ANCHORING_FEATURE_COLS:
-        mart1[col] = customer_ids.map(anchoring_visits[col])
+    features[GENDER_COL] = customer_ids.map(customers[GENDER_COL])
+    features[AGE_COL] = _age_in_years(
+        pd.to_datetime(customer_ids.map(customers[BIRTH_DATE_COL])), snapshot_dates
+    )
+    features[FAMILY_VISIT_COUNT_COL] = _family_visit_counts_as_of(
+        visits, customer_ids.map(customers[FAMILY_ID_COL]), snapshot_dates
+    )
+
+    # Each customer's visits in chronological order (stable, so same-day
+    # visits keep their original relative order); rows start..end-1 of this
+    # table are each query row's visits at or before its snapshot date.
+    history = (
+        visits[visits[VISIT_DATE_COL].notna()]
+        .sort_values([CUSTOMER_ID_COL, VISIT_DATE_COL], kind="stable")
+        .reset_index(drop=True)
+    )
+    start, end = _as_of_positions(
+        pd.Index(history[CUSTOMER_ID_COL]),
+        history[VISIT_DATE_COL],
+        pd.Index(customer_ids),
+        snapshot_dates,
+        side="right",
+    )
+    features = features.join(_anchoring_visit_features(history, start, end, snapshot_dates))
+    features = features.join(_mpr_as_of(history, start, end, customer_ids.index))
+    features[NO_SHOW_RATE_COL] = _no_show_rate_as_of(history, customer_ids, snapshot_dates)
+
+    for col in MART1_NUMERIC_FEATURE_COLS:
+        features[col] = features[col].astype(float)
+    for col in MART1_BOOLEAN_FEATURE_COLS:
+        features[col] = features[col].astype("boolean")
+    return features
+
+
+def _visit_table(raw_visits: pd.DataFrame) -> pd.DataFrame:
+    """One row per 조제판매ID (in first-appearance order) with every
+    visit-level attribute Mart 1's as-of features read: customer and family
+    identity, 내방일/다음내방일, 처방조제일수, insurance/차상위 status, and
+    the visit's primary drug (see `_primary_drug_by_visit`)."""
+    visits = _one_row_per_visit(
+        raw_visits,
+        [
+            CUSTOMER_ID_COL,
+            FAMILY_ID_COL,
+            VISIT_DATE_COL,
+            NEXT_EXPECTED_VISIT_COL,
+            PRESCRIPTION_DAYS_COL,
+            INSURANCE_TYPE_COL,
+            NEAR_POVERTY_COL,
+        ],
+    )
+    visits[VISIT_DATE_COL] = pd.to_datetime(visits[VISIT_DATE_COL])
+    visits[NEXT_EXPECTED_VISIT_COL] = pd.to_datetime(visits[NEXT_EXPECTED_VISIT_COL])
+    visits[PRESCRIPTION_DAYS_COL] = pd.to_numeric(visits[PRESCRIPTION_DAYS_COL])
+    return visits.join(_primary_drug_by_visit(raw_visits)).reset_index()
+
+
+def _primary_drug_by_visit(raw_visits: pd.DataFrame) -> pd.DataFrame:
+    """Per 조제판매ID, the 투약일수/속명 of whichever drug has the longest
+    투약일수 -- the same drug 장기투약_일수 and 주요_약품속명 both name (see
+    CONTEXT.md's Mart 1 entry); on a tie, the visit's first such drug row.
+    A visit whose drug rows are all missing 투약일수 has no row here (its
+    primary drug is undefined, NA once joined)."""
+    medication_days = pd.to_numeric(raw_visits[MEDICATION_DAYS_COL], errors="coerce")
+    drugs = raw_visits[[VISIT_ID_COL, INGREDIENT_COL]].assign(
+        **{LONG_TERM_MED_DAYS_COL: medication_days}
+    )[medication_days.notna()]
+    is_longest = drugs[LONG_TERM_MED_DAYS_COL].eq(
+        drugs.groupby(VISIT_ID_COL)[LONG_TERM_MED_DAYS_COL].transform("max")
+    )
+    primary = drugs[is_longest].groupby(VISIT_ID_COL, sort=False).head(1)
+    return primary.set_index(VISIT_ID_COL)[[LONG_TERM_MED_DAYS_COL, INGREDIENT_COL]].rename(
+        columns={INGREDIENT_COL: PRIMARY_INGREDIENT_COL}
+    )
+
+
+def _age_in_years(birth_dates: pd.Series, as_of_dates: pd.Series) -> pd.Series:
+    """Whole-year age as of each row's `as_of_dates` value, accounting for
+    whether that year's birthday has already passed."""
+    had_birthday_this_year = (birth_dates.dt.month < as_of_dates.dt.month) | (
+        (birth_dates.dt.month == as_of_dates.dt.month)
+        & (birth_dates.dt.day <= as_of_dates.dt.day)
+    )
+    return as_of_dates.dt.year - birth_dates.dt.year - (~had_birthday_this_year).astype(int)
+
+
+def _family_visit_counts_as_of(
+    visits: pd.DataFrame, family_ids: pd.Series, snapshot_dates: pd.Series
+) -> pd.Series:
+    """가족_총내방 for each row: the number of distinct visits by that row's
+    가족ID dated strictly before its snapshot date (see `family_totals_as_of`
+    for why strictly). 0 for a known family with no prior visit yet; NA for
+    a 가족ID that never appears on any visit."""
+    counted = (
+        visits[visits[FAMILY_ID_COL].notna() & visits[VISIT_DATE_COL].notna()]
+        .sort_values([FAMILY_ID_COL, VISIT_DATE_COL], kind="stable")
+    )
+    start, end = _as_of_positions(
+        pd.Index(counted[FAMILY_ID_COL]),
+        counted[VISIT_DATE_COL],
+        pd.Index(family_ids),
+        snapshot_dates,
+        side="left",
+    )
+    counts = pd.Series(end - start, index=family_ids.index)
+    return counts.where(family_ids.isin(visits[FAMILY_ID_COL]))
+
+
+def _anchoring_visit_features(
+    history: pd.DataFrame, start: np.ndarray, end: np.ndarray, snapshot_dates: pd.Series
+) -> pd.DataFrame:
+    """The visit-timing/medication/insurance features derived from each
+    row's "anchoring visit" -- its customer's most recent visit at or
+    before the row's snapshot date (`history` rows start..end-1, see
+    `_mart1_x_features`). Indexed like `snapshot_dates`.
+
+    Uses `<=` (a visit dated exactly on the snapshot date is eligible to
+    anchor), matching `_build_mart2`'s latest-consumption-value lookup --
+    this is "what do we know as of this snapshot" for a point-feature, not a
+    cumulative count. That's a different question from `family_totals_as_of`
+    using strict `<`: a cumulative total must exclude the row's own visit to
+    avoid a visit counting itself (per docs/adr/0002-point-in-time-correctness.md,
+    "up to but excluding that visit"), but there's no equivalent
+    self-counting risk in picking which single visit anchors these features.
+
+    Every attribute is read from the anchoring visit alone: a value missing
+    on that visit stays missing (NA), never back-filled from an earlier
+    visit (see CONTEXT.md "Anchoring Visit"). A row with no visit at or
+    before its snapshot date has no anchoring visit yet, so its features
+    come back missing (NA) rather than computed from a future visit.
+    """
+    visit_cols = [
+        NEXT_EXPECTED_VISIT_COL,
+        LONG_TERM_MED_DAYS_COL,
+        PRIMARY_INGREDIENT_COL,
+        INSURANCE_TYPE_COL,
+        NEAR_POVERTY_COL,
+    ]
+    if history.empty:
+        anchoring = pd.DataFrame(np.nan, index=snapshot_dates.index, columns=ANCHORING_FEATURE_COLS)
+        anchoring[NEAR_POVERTY_COL] = False
+        return anchoring
+
+    has_anchor = pd.Series(end > start, index=snapshot_dates.index)
+    anchor_rows = np.where(has_anchor, end - 1, 0)
+    anchoring = history[visit_cols].iloc[anchor_rows].set_axis(snapshot_dates.index)
+    anchoring[VISIT_DATE_COL] = pd.to_datetime(
+        history[VISIT_DATE_COL].iloc[anchor_rows]
+    ).set_axis(snapshot_dates.index)
+    anchoring = anchoring.where(has_anchor, np.nan)
+
+    anchoring[DAYS_SINCE_LAST_VISIT_COL] = (snapshot_dates - anchoring[VISIT_DATE_COL]).dt.days
+    # 남은_약_일수: days left on the anchoring visit's longest-투약일수 drug
+    # (장기투약_일수) minus days elapsed since that visit. Issue #7 doesn't
+    # give an explicit formula ("days of medication remaining"), so this is
+    # an implementation judgment call, not a spec-given identity. Left
+    # unclamped by design -- a negative value means the patient is overdue
+    # for refill on that drug, which is itself a meaningful signal for
+    # Track 1's visit-probability model, not an error case to hide.
+    anchoring[REMAINING_MED_DAYS_COL] = (
+        anchoring[LONG_TERM_MED_DAYS_COL] - anchoring[DAYS_SINCE_LAST_VISIT_COL]
+    )
+    anchoring[TOMORROW_IS_EXPECTED_VISIT_COL] = (
+        snapshot_dates + pd.Timedelta(days=1)
+        == pd.to_datetime(anchoring[NEXT_EXPECTED_VISIT_COL])
+    ).where(has_anchor)
     # 차상위대상자 is a raw 'Y'/blank eligibility flag (same source table and
     # convention as the severity flags) — normalize to boolean the same way.
-    mart1[NEAR_POVERTY_COL] = _eligibility_flag_mask(mart1[NEAR_POVERTY_COL])
-    for col in MPR_NO_SHOW_FEATURE_COLS:
-        mart1[col] = customer_ids.map(mpr_and_no_show[col])
-    return mart1
+    anchoring[NEAR_POVERTY_COL] = _eligibility_flag_mask(anchoring[NEAR_POVERTY_COL])
+    return anchoring[ANCHORING_FEATURE_COLS]
+
+
+def _mpr_as_of(
+    history: pd.DataFrame, start: np.ndarray, end: np.ndarray, index: pd.Index
+) -> pd.DataFrame:
+    """복약_순응도 (MPR adherence score) for each row, from its customer's
+    visits at or before its snapshot date (`history` rows start..end-1, see
+    `_mart1_x_features`), per docs/Research-Log.md's formula:
+        Sigma(처방조제일수) / (최종내방일 - 최초내방일 + 최종조제일수) x 100
+    NA when there's no eligible visit, or when that denominator isn't a
+    usable number -- either the last eligible visit's 처방조제일수 is itself
+    missing, or the denominator comes out to zero (a single eligible visit
+    with 처방조제일수 == 0) -- rather than propagating a raw NaN or dividing
+    by zero.
+    """
+    if history.empty:
+        return pd.DataFrame({MPR_COL: np.nan}, index=index)
+
+    prescription_days = history[PRESCRIPTION_DAYS_COL].to_numpy(dtype=float)
+    visit_dates = history[VISIT_DATE_COL].to_numpy("datetime64[ns]")
+    cumulative_days = np.concatenate([[0.0], np.cumsum(np.nan_to_num(prescription_days))])
+
+    has_visit = end > start
+    first_row = np.where(has_visit, start, 0)
+    last_row = np.where(has_visit, end - 1, 0)
+    span_days = pd.Series(visit_dates[last_row] - visit_dates[first_row]).dt.days.to_numpy()
+    last_prescription_days = prescription_days[last_row]
+    denominator = span_days + last_prescription_days
+    usable = has_visit & ~np.isnan(last_prescription_days) & (denominator != 0)
+    total_days = cumulative_days[end] - cumulative_days[start]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        mpr = np.where(usable, total_days / denominator * 100, np.nan)
+    return pd.DataFrame({MPR_COL: mpr}, index=index)
+
+
+def _no_show_rate_as_of(
+    visits: pd.DataFrame, customer_ids: pd.Series, snapshot_dates: pd.Series
+) -> pd.Series:
+    """노쇼_비율 (no-show rate) for each row: of its customer's visits whose
+    다음내방일 is already resolvable as of the row's snapshot date (both the
+    visit and its 다음내방일 on or before that date -- a later 다음내방일
+    hasn't happened yet, so we can't yet know whether it'll be kept), the
+    proportion not matched by an actual visit by that customer dated exactly
+    on that 다음내방일. NA if none are resolvable yet -- there's no history
+    to compute a rate from, not evidence of a 0% or 100% rate.
+    """
+    resolvable = visits[visits[NEXT_EXPECTED_VISIT_COL].notna()]
+    kept = pd.MultiIndex.from_frame(
+        resolvable[[CUSTOMER_ID_COL, NEXT_EXPECTED_VISIT_COL]]
+    ).isin(pd.MultiIndex.from_frame(visits[[CUSTOMER_ID_COL, VISIT_DATE_COL]]))
+    resolvable = resolvable.assign(
+        _resolved_on=resolvable[[VISIT_DATE_COL, NEXT_EXPECTED_VISIT_COL]].max(axis=1),
+        _missed=~kept,
+    ).sort_values([CUSTOMER_ID_COL, "_resolved_on"], kind="stable")
+
+    start, end = _as_of_positions(
+        pd.Index(resolvable[CUSTOMER_ID_COL]),
+        resolvable["_resolved_on"],
+        pd.Index(customer_ids),
+        snapshot_dates,
+        side="right",
+    )
+    cumulative_missed = np.concatenate([[0], np.cumsum(resolvable["_missed"].to_numpy())])
+    resolved_count = end - start
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rate = np.where(
+            resolved_count > 0,
+            (cumulative_missed[end] - cumulative_missed[start]) / resolved_count,
+            np.nan,
+        )
+    return pd.Series(rate, index=customer_ids.index)
 
 
 def _attach_mart1_weight(
@@ -773,203 +1072,6 @@ def _attach_mart1_weight(
     mart1 = mart1.copy()
     mart1[WEIGHT_COL] = mart1[CUSTOMER_ID_COL].map(weights)
     return mart1
-
-
-def _customer_attrs_as_of(raw_visits: pd.DataFrame, as_of_date: pd.Timestamp) -> pd.DataFrame:
-    """Per 고객ID demographic/family attributes that don't vary by visit:
-    성별, 나이 (computed as of `as_of_date` from 생년월일), and 가족ID (used
-    to look up that customer's as-of family visit total)."""
-    customers = _one_row_per_visit(
-        raw_visits,
-        [GENDER_COL, BIRTH_DATE_COL, FAMILY_ID_COL],
-        group_col=CUSTOMER_ID_COL,
-    )
-    customers[AGE_COL] = _age_in_years(
-        pd.to_datetime(customers[BIRTH_DATE_COL]), as_of_date
-    )
-    return customers
-
-
-def _age_in_years(birth_dates: pd.Series, as_of_date: pd.Timestamp) -> pd.Series:
-    """Whole-year age as of `as_of_date`, accounting for whether that year's
-    birthday has already passed."""
-    had_birthday_this_year = (birth_dates.dt.month < as_of_date.month) | (
-        (birth_dates.dt.month == as_of_date.month) & (birth_dates.dt.day <= as_of_date.day)
-    )
-    return (
-        as_of_date.year - birth_dates.dt.year - (~had_birthday_this_year).astype(int)
-    )
-
-
-def _visit_level_mart1_attrs(raw_visits: pd.DataFrame) -> pd.DataFrame:
-    """One row per 조제판매ID with the visit-level attributes Mart 1's
-    as-of features anchor to: customer identity, the visit's own 다음내방일,
-    insurance/차상위 status, and its primary drug (the drug with the
-    longest 투약일수 in that visit — the same drug 장기투약_일수 and
-    주요_약품속명 both name, see CONTEXT.md's Mart 1 entry)."""
-    visits = _one_row_per_visit(
-        raw_visits,
-        [
-            CUSTOMER_ID_COL,
-            VISIT_DATE_COL,
-            NEXT_EXPECTED_VISIT_COL,
-            INSURANCE_TYPE_COL,
-            NEAR_POVERTY_COL,
-        ],
-    )
-    primary_drug = raw_visits.groupby(VISIT_ID_COL, sort=False).apply(
-        _primary_drug_for_visit, include_groups=False
-    )
-    return visits.join(primary_drug)
-
-
-def _primary_drug_for_visit(visit_drugs: pd.DataFrame) -> pd.Series:
-    """Given one visit's drug rows, the 투약일수/속명 of whichever drug has
-    the longest 투약일수 -- undefined (NA) if every drug row is missing
-    투약일수."""
-    medication_days = pd.to_numeric(visit_drugs[MEDICATION_DAYS_COL], errors="coerce")
-    if medication_days.notna().any():
-        primary_row = medication_days.idxmax()
-        return pd.Series(
-            {
-                LONG_TERM_MED_DAYS_COL: medication_days.loc[primary_row],
-                PRIMARY_INGREDIENT_COL: visit_drugs.loc[primary_row, INGREDIENT_COL],
-            }
-        )
-    return pd.Series({LONG_TERM_MED_DAYS_COL: pd.NA, PRIMARY_INGREDIENT_COL: pd.NA})
-
-
-def _empty_customer_frame(columns: list[str]) -> pd.DataFrame:
-    """An empty per-고객ID feature frame with the given columns -- the shared
-    empty-result shape for as-of feature builders (see
-    `_anchoring_visit_features` and `_mpr_and_no_show_as_of`) when no visit
-    is eligible at all as of `as_of_date`."""
-    return pd.DataFrame(columns=columns).set_index(pd.Index([], name=CUSTOMER_ID_COL))
-
-
-def _anchoring_visit_features(
-    raw_visits: pd.DataFrame, as_of_date: pd.Timestamp
-) -> pd.DataFrame:
-    """Per 고객ID, the visit-timing/medication/insurance features derived
-    from that customer's most recent visit at or before `as_of_date` (their
-    "anchoring visit").
-
-    Uses `<=` (a visit dated exactly `as_of_date` is eligible to anchor),
-    matching `_build_mart2`'s latest-consumption-value lookup -- this is
-    "what do we know as of this snapshot" for a point-feature, not a
-    cumulative count. That's a different question from `family_totals_as_of`
-    using strict `<`: a cumulative total must exclude the row's own visit to
-    avoid a visit counting itself (per docs/adr/0002-point-in-time-correctness.md,
-    "up to but excluding that visit"), but there's no equivalent
-    self-counting risk in picking which single visit anchors these features.
-
-    A customer with no visit at or before `as_of_date` has no anchoring
-    visit yet, so its features come back missing (NA) rather than computed
-    from a future visit.
-    """
-    visits = _visit_level_mart1_attrs(raw_visits).reset_index()
-    eligible = visits[visits[VISIT_DATE_COL] <= as_of_date]
-    if eligible.empty:
-        return _empty_customer_frame(ANCHORING_FEATURE_COLS)
-
-    anchoring = (
-        eligible.sort_values(VISIT_DATE_COL, kind="stable")
-        .groupby(CUSTOMER_ID_COL, as_index=True, sort=False)
-        .last()
-    )
-    anchoring[DAYS_SINCE_LAST_VISIT_COL] = (
-        as_of_date - anchoring[VISIT_DATE_COL]
-    ).dt.days
-    # 남은_약_일수: days left on the anchoring visit's longest-투약일수 drug
-    # (장기투약_일수) minus days elapsed since that visit. Issue #7 doesn't
-    # give an explicit formula ("days of medication remaining"), so this is
-    # an implementation judgment call, not a spec-given identity. Left
-    # unclamped by design -- a negative value means the patient is overdue
-    # for refill on that drug, which is itself a meaningful signal for
-    # Track 1's visit-probability model, not an error case to hide.
-    anchoring[REMAINING_MED_DAYS_COL] = (
-        anchoring[LONG_TERM_MED_DAYS_COL] - anchoring[DAYS_SINCE_LAST_VISIT_COL]
-    )
-    anchoring[TOMORROW_IS_EXPECTED_VISIT_COL] = (
-        as_of_date + pd.Timedelta(days=1) == anchoring[NEXT_EXPECTED_VISIT_COL]
-    )
-    return anchoring[ANCHORING_FEATURE_COLS]
-
-
-def _mpr_and_no_show_as_of(raw_visits: pd.DataFrame, as_of_date: pd.Timestamp) -> pd.DataFrame:
-    """Per 고객ID, the MPR adherence score (복약_순응도) and no-show rate
-    (노쇼_비율) computed purely from that customer's own visit history at or
-    before `as_of_date` (see CONTEXT.md's Mart 1 entry and issue #8).
-
-    Unlike `_anchoring_visit_features`, these aren't anchored to a single
-    visit -- they aggregate over every one of the customer's visits with
-    내방일 <= as_of_date.
-
-    Returns one row per 고객ID (an empty frame if no visits are eligible)
-    with columns MPR_NO_SHOW_FEATURE_COLS.
-    """
-    visits = _one_row_per_visit(
-        raw_visits,
-        [CUSTOMER_ID_COL, VISIT_DATE_COL, PRESCRIPTION_DAYS_COL, NEXT_EXPECTED_VISIT_COL],
-    ).reset_index()
-    eligible = visits[visits[VISIT_DATE_COL] <= as_of_date]
-    if eligible.empty:
-        return _empty_customer_frame(MPR_NO_SHOW_FEATURE_COLS)
-
-    return eligible.groupby(CUSTOMER_ID_COL, sort=False).apply(
-        lambda customer_visits: _mpr_and_no_show_for_customer(customer_visits, as_of_date),
-        include_groups=False,
-    )
-
-
-def _mpr_and_no_show_for_customer(
-    visits: pd.DataFrame, as_of_date: pd.Timestamp
-) -> pd.Series:
-    """MPR adherence score and no-show rate for one customer's eligible
-    (내방일 <= as_of_date) visit history.
-
-    MPR (복약_순응도), per docs/Research-Log.md's formula:
-        Sigma(처방조제일수) / (최종내방일 - 최초내방일 + 최종조제일수) x 100
-    복약_순응도 is NA whenever that denominator isn't a usable number --
-    either the last eligible visit's 처방조제일수 is itself missing, or the
-    denominator comes out to zero (a single eligible visit with
-    처방조제일수 == 0) -- rather than propagating a raw NaN or dividing by
-    zero.
-
-    노쇼_비율 (no-show rate): the proportion of this customer's 다음내방일
-    values that are themselves already resolvable as of `as_of_date` (i.e.
-    다음내방일 <= as_of_date -- a later 다음내방일 hasn't happened yet, so we
-    can't yet know whether it'll be kept) and that aren't matched by an
-    actual visit dated exactly on that 다음내방일. NA if none of this
-    customer's 다음내방일 values are resolvable yet -- there's no history to
-    compute a rate from, not evidence of a 0% or 100% rate.
-    """
-    ordered = visits.sort_values(VISIT_DATE_COL, kind="stable")
-    first_visit, last_visit = ordered.iloc[0], ordered.iloc[-1]
-    last_prescription_days = last_visit[PRESCRIPTION_DAYS_COL]
-    if pd.isna(last_prescription_days):
-        mpr = pd.NA
-    else:
-        denominator = (
-            last_visit[VISIT_DATE_COL] - first_visit[VISIT_DATE_COL]
-        ).days + last_prescription_days
-        mpr = (
-            ordered[PRESCRIPTION_DAYS_COL].sum() / denominator * 100
-            if denominator
-            else pd.NA
-        )
-
-    resolvable = ordered[NEXT_EXPECTED_VISIT_COL].notna() & (
-        ordered[NEXT_EXPECTED_VISIT_COL] <= as_of_date
-    )
-    if resolvable.any():
-        actual_visit_dates = set(ordered[VISIT_DATE_COL])
-        resolvable_next_dates = ordered.loc[resolvable, NEXT_EXPECTED_VISIT_COL]
-        no_show_rate = (~resolvable_next_dates.isin(actual_visit_dates)).mean()
-    else:
-        no_show_rate = pd.NA
-
-    return pd.Series({MPR_COL: mpr, NO_SHOW_RATE_COL: no_show_rate})
 
 
 def family_totals_as_of(raw_visits: pd.DataFrame, as_of_date) -> pd.DataFrame:
@@ -998,10 +1100,12 @@ def family_totals_as_of(raw_visits: pd.DataFrame, as_of_date) -> pd.DataFrame:
         .sort_values(FAMILY_ID_COL)
         .reset_index(drop=True)
     )
-    prior_visits = visits[visits[VISIT_DATE_COL] < as_of_date]
-    counts = prior_visits.groupby(FAMILY_ID_COL).size()
     families[FAMILY_VISIT_COUNT_COL] = (
-        families[FAMILY_ID_COL].map(counts).fillna(0).astype(int)
+        _family_visit_counts_as_of(
+            visits, families[FAMILY_ID_COL], pd.Series(as_of_date, index=families.index)
+        )
+        .fillna(0)
+        .astype(int)
     )
     return families
 
@@ -1009,7 +1113,9 @@ def family_totals_as_of(raw_visits: pd.DataFrame, as_of_date) -> pd.DataFrame:
 def _build_mart2(raw_visits: pd.DataFrame, as_of_date: pd.Timestamp) -> pd.DataFrame:
     """Per 고객ID×약품ID, the latest single-visit consumption amount at or
     before `as_of_date` — never the global-latest value across the whole
-    extract, per docs/adr/0002-point-in-time-correctness.md.
+    extract, per docs/adr/0002-point-in-time-correctness.md. A 소모량
+    missing on that latest visit stays missing, never back-filled from an
+    earlier visit (the same rule as CONTEXT.md "Anchoring Visit").
     """
     eligible = _visits_at_or_before(raw_visits, as_of_date).dropna(subset=[DRUG_ID_COL])
     if eligible.empty:
@@ -1018,8 +1124,8 @@ def _build_mart2(raw_visits: pd.DataFrame, as_of_date: pd.Timestamp) -> pd.DataF
     subset = eligible[[CUSTOMER_ID_COL, DRUG_ID_COL, VISIT_DATE_COL, CONSUMPTION_COL]]
     latest = (
         subset.sort_values(VISIT_DATE_COL, kind="stable")
-        .groupby([CUSTOMER_ID_COL, DRUG_ID_COL], as_index=False, sort=False)
-        .last()
+        .groupby([CUSTOMER_ID_COL, DRUG_ID_COL], sort=False)
+        .tail(1)
     )
     mart2 = latest[[CUSTOMER_ID_COL, DRUG_ID_COL, CONSUMPTION_COL]].rename(
         columns={CONSUMPTION_COL: MART2_VALUE_COL}

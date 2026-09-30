@@ -6,9 +6,9 @@ Trains Track 1's model once on `split_mart1_training_set`'s train/val split
 (matching production's own training path, see `pipeline.model
 .train_track1_model`), then walks the trained model forward across the
 split's test window. A full run walks one calendar day at a time across the
-whole test window (6 months by default) -- each day rebuilds Mart 1/2/3 from
-the full raw extract, so this can take a long time end to end on a large
-extract; pass a narrower `--test-dates-limit` while iterating.
+whole test window (6 months by default), rebuilding Mart 1/2/3 as of each
+day -- a few seconds per day on the v0.3 extract; pass a narrower
+`--test-dates-limit` while iterating.
 
 Usage: python scripts/run_backtest.py [--test-dates-limit N]
 """

@@ -25,6 +25,10 @@ Complement of Chronic Patient — visits that don't match the Revisit Match patt
 Chronic-patient training set for Track 1's ML model. X = patient/visit profile features (including MPR adherence score and per-patient no-show rate, both derived purely from `tbl매출` and added alongside the originally-planned feature set, plus 차상위대상자 alongside 보험구분 as copay-sensitivity signals), Y = Next-Day Visit label, sample-weighted by severity/chronic tier (see Severe/특례 Weight Tier). Inclusion filter and negative sampling both key off Chronic Patient / Revisit Match status, not diagnosis code. 주요_진료과 (primary department) is dropped entirely — the underlying data was never extractable (see Test-Log) and isn't proxied by another column. 주요_약품속명 (primary active ingredient) is defined as the 속명 of whichever drug in the visit has the longest 투약일수 — the same drug that drives the 장기투약_일수 feature, so both features name the same "primary drug."
 _Avoid_: 처방전발행기관ID as a stand-in for 주요_진료과 — it's an opaque institution ID with no department-level meaning
 
+**Anchoring Visit**:
+For a Mart 1 row, the customer's most recent visit on or before that row's snapshot date. Visit-level features (마지막방문_경과일, 남은_약_일수, 내일이_예약일, 장기투약_일수, 주요_약품속명, 보험구분, 차상위대상자) are read from this one visit only: a value missing on the Anchoring Visit stays missing, never back-filled from an earlier visit. A row with no visit on or before its snapshot date has no Anchoring Visit, and all these features are missing.
+_Avoid_: "last known value" — e.g. a 차상위대상자 'Y' on an earlier visit does not make a later blank visit 'Y'
+
 **Negative Sampling**:
 For building Mart 1's Y=0 examples, the early/mid/late-window sampling scheme (1 sample early, 1 mid, 2–3 late per patient-cycle) is the authoritative spec; its resulting ~1:5 positive:negative ratio is the accepted outcome, not the "1:3" figure that appears in older planning notes.
 _Avoid_: citing "1:3" as the target ratio
@@ -38,7 +42,7 @@ _Avoid_: assuming this shares Mart 1's per-row leakage-safety property for Chron
 _Avoid_: shrinking or padding val/test to hit a fixed train:val:test proportion — only train's size is allowed to vary
 
 **Mart 2 (Customer Drug Profile Mart)**:
-Per customer×drug, stores the **latest single-visit consumption amount** (not an average across visits) — deliberately avoiding "the averaging pitfall" where a changed dosage gets smoothed away.
+Per customer×drug, stores the **latest single-visit consumption amount** (not an average across visits) — deliberately avoiding "the averaging pitfall" where a changed dosage gets smoothed away. Same no-back-fill rule as Anchoring Visit: if that latest visit's 소모량 is missing, the value is missing (that customer×drug contributes nothing to Track 1 demand), never an earlier visit's amount.
 _Avoid_: "average consumption" for this mart's value column
 
 **Mart 3 (Acute Drug Statistics Mart)**:

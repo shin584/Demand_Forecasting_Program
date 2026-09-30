@@ -113,3 +113,22 @@ def test_matches_across_multiple_drug_line_rows_of_the_same_visit():
     matches = revisit_match(raw_visits)
 
     assert matches.loc[1] == True  # noqa: E712
+
+
+def test_match_found_past_an_in_window_visit_that_shares_no_drug():
+    raw_visits = make_raw_visits(
+        make_high_frequency_filler_visits()
+        + [
+            make_visit_row(
+                조제판매ID=1, 고객ID=1, 내방일="2024-01-01", 다음내방일="2024-01-31", 약품ID=1
+            ),
+            # Inside visit 1's window, but shares no drug with it...
+            make_visit_row(조제판매ID=2, 고객ID=1, 내방일="2024-01-20", 약품ID=2),
+            # ...so the match has to come from this later in-window visit.
+            make_visit_row(조제판매ID=3, 고객ID=1, 내방일="2024-02-10", 약품ID=1),
+        ]
+    )
+
+    matches = revisit_match(raw_visits)
+
+    assert matches.loc[1] == True  # noqa: E712

@@ -7,7 +7,14 @@ from conftest import (
     make_raw_visits,
     make_visit_row,
 )
-from pipeline.marts import MART1_COLUMNS, MART2_COLUMNS, MART3_COLUMNS, build_marts
+from pipeline.marts import (
+    MART1_BOOLEAN_FEATURE_COLS,
+    MART1_COLUMNS,
+    MART1_NUMERIC_FEATURE_COLS,
+    MART2_COLUMNS,
+    MART3_COLUMNS,
+    build_marts,
+)
 
 
 def test_build_marts_returns_three_well_defined_marts():
@@ -96,6 +103,20 @@ def test_mart2_uses_latest_consumption_at_or_before_as_of_date():
     value = mart2.set_index(["고객ID", "약품ID"])["최근소모량"]
     assert value.loc[(1, 1)] == 60.0
 
+
+
+def test_mart2_latest_consumption_missing_stays_missing():
+    raw_visits = make_raw_visits(
+        [
+            make_visit_row(조제판매ID=1, 고객ID=1, 내방일="2024-01-01", 약품ID=1, 소모량=30.0),
+            make_visit_row(조제판매ID=2, 고객ID=1, 내방일="2024-02-01", 약품ID=1, 소모량=None),
+        ]
+    )
+
+    _, mart2, _ = build_marts(raw_visits, as_of_date="2024-02-01")
+
+    # The latest visit has no 소모량 -- visit 1's 30.0 must not be back-filled in.
+    assert pd.isna(mart2.set_index(["고객ID", "약품ID"]).loc[(1, 1), "최근소모량"])
 
 def test_mart2_excludes_visits_after_as_of_date():
     raw_visits = make_raw_visits(
@@ -605,3 +626,51 @@ def test_mpr_is_na_when_last_eligible_visits_prescription_days_is_missing():
     mart1, _, _ = build_marts(raw_visits, as_of_date="2024-01-01")
 
     assert pd.isna(mart1.set_index("고객ID")["복약_순응도"].loc[1])
+
+
+def test_primary_ingredient_tie_goes_to_the_visits_first_drug_row():
+    raw_visits = make_raw_visits(
+        make_high_frequency_filler_visits()
+        + [
+            *make_independent_chronic_match_visits(customer_id=1, drug_id=101, visit_id_start=10),
+            make_visit_row(조제판매ID=1, 고객ID=1, 내방일="2024-01-01", 약품ID=1, 투약일수=30, 속명="ingredientA"),
+            make_visit_row(조제판매ID=1, 고객ID=1, 내방일="2024-01-01", 약품ID=2, 투약일수=30, 속명="ingredientB"),
+        ]
+    )
+
+    mart1, _, _ = build_marts(raw_visits, as_of_date="2024-01-01")
+
+    assert mart1.set_index("고객ID").loc[1, "주요_약품속명"] == "ingredientA"
+
+
+def test_anchoring_attribute_missing_on_the_anchoring_visit_stays_missing():
+    raw_visits = make_raw_visits(
+        make_high_frequency_filler_visits()
+        + [
+            *make_independent_chronic_match_visits(customer_id=1, drug_id=101, visit_id_start=10),
+            make_visit_row(조제판매ID=1, 고객ID=1, 내방일="2024-01-01", 보험구분="의료급여"),
+            make_visit_row(조제판매ID=2, 고객ID=1, 내방일="2024-02-01", 보험구분=None),
+        ]
+    )
+
+    mart1, _, _ = build_marts(raw_visits, as_of_date="2024-02-01")
+
+    row = mart1.set_index("고객ID").loc[1]
+    # Visit 2 anchors (마지막방문_경과일 == 0) and has no 보험구분 of its own --
+    # visit 1's value must not be back-filled in.
+    assert row["마지막방문_경과일"] == 0
+    assert pd.isna(row["보험구분"])
+
+
+def test_mart1_x_features_have_lightgbm_ready_dtypes():
+    raw_visits = make_raw_visits(
+        make_high_frequency_filler_visits()
+        + make_independent_chronic_match_visits(customer_id=1, drug_id=101, visit_id_start=10)
+    )
+
+    mart1, _, _ = build_marts(raw_visits, as_of_date="2024-01-01")
+
+    for col in MART1_NUMERIC_FEATURE_COLS:
+        assert mart1[col].dtype == "float64", col
+    for col in MART1_BOOLEAN_FEATURE_COLS:
+        assert mart1[col].dtype == "boolean", col

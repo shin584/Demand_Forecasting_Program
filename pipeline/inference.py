@@ -113,7 +113,29 @@ def run_track1_inference(
     """
     as_of_date = pd.Timestamp(as_of_date)
     mart1, mart2, _mart3 = build_marts(raw_visits, as_of_date)
+    return _track1_from_marts(
+        mart1,
+        mart2,
+        raw_visits,
+        as_of_date,
+        model,
+        chronic_visit_prob_cutoff,
+        rare_drug_patient_threshold,
+    )
 
+
+def _track1_from_marts(
+    mart1: pd.DataFrame,
+    mart2: pd.DataFrame,
+    raw_visits: pd.DataFrame,
+    as_of_date: pd.Timestamp,
+    model,
+    chronic_visit_prob_cutoff: float,
+    rare_drug_patient_threshold: int,
+) -> Track1Result:
+    """`run_track1_inference`'s body, given an already-built Mart 1/Mart 2
+    snapshot -- so `run_daily_forecast` can reuse its own `build_marts` call
+    instead of building the same snapshot twice."""
     probabilities = _score_mart1(mart1, model)
 
     visit_list = _build_visit_list(
@@ -228,9 +250,7 @@ def run_daily_forecast(
 
     `mart3_bucket_min_observations`/`mart3_season_min_observations` are
     forwarded to `build_marts` for Mart 3 only (see that function) -- they
-    don't affect Track 1's own Mart 1/Mart 2-based computation, which
-    `run_track1_inference` still derives via its own (default-threshold)
-    `build_marts` call. `rare_drug_patient_threshold` is forwarded to both:
+    don't affect Track 1's own Mart 1/Mart 2-based computation. `rare_drug_patient_threshold` is forwarded to both:
     Mart 3's Acute-population rare-drug filter and Track 1's own
     Chronic-population rare-drug allocation override (see CONTEXT.md
     "Decision Thresholds (provisional)" and docs/adr/0004) -- one shared
@@ -243,14 +263,23 @@ def run_daily_forecast(
     `safety_stock_buffer` (see CONTEXT.md "Safety Stock").
     """
     as_of_date = pd.Timestamp(as_of_date)
-    track1 = run_track1_inference(
-        raw_visits, as_of_date, model, chronic_visit_prob_cutoff, rare_drug_patient_threshold
-    )
-    _mart1, _mart2, mart3 = build_marts(
+    # One snapshot serves both tracks: the Mart 3 thresholds passed here
+    # don't touch Mart 1/Mart 2, so Track 1 sees exactly what its own
+    # default-threshold `build_marts` call would have built.
+    mart1, mart2, mart3 = build_marts(
         raw_visits,
         as_of_date,
         mart3_bucket_min_observations,
         mart3_season_min_observations,
+        rare_drug_patient_threshold,
+    )
+    track1 = _track1_from_marts(
+        mart1,
+        mart2,
+        raw_visits,
+        as_of_date,
+        model,
+        chronic_visit_prob_cutoff,
         rare_drug_patient_threshold,
     )
     order_quantities = _combine_order_quantities(

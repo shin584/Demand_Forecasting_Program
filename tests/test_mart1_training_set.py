@@ -1,10 +1,20 @@
 import pandas as pd
 
-from conftest import make_high_frequency_filler_visits, make_raw_visits, make_visit_row
+from conftest import (
+    make_high_frequency_filler_visits,
+    make_independent_chronic_match_visits,
+    make_raw_visits,
+    make_visit_row,
+)
 from pipeline.marts import (
+    MART1_BOOLEAN_FEATURE_COLS,
+    MART1_COLUMNS,
+    MART1_NON_FEATURE_COLS,
+    MART1_NUMERIC_FEATURE_COLS,
     MART1_TRAINING_COLUMNS,
     SNAPSHOT_DATE_COL,
     build_mart1_training_set,
+    build_marts,
     sample_mart1_negatives,
     split_mart1_training_set,
 )
@@ -107,6 +117,44 @@ def test_x_features_are_computed_as_of_each_rows_own_snapshot_date():
     # elapsed since it, and V2 itself must not leak in.
     assert training_set.loc[pd.Timestamp("2024-02-14"), "마지막방문_경과일"] == 44
 
+
+
+def test_x_features_match_build_marts_snapshot_for_the_same_date():
+    # Training (many snapshot dates at once) and daily inference (one
+    # build_marts snapshot) must compute every X-feature identically.
+    raw_visits = make_raw_visits(
+        make_high_frequency_filler_visits()
+        + make_independent_chronic_match_visits(customer_id=1, drug_id=101, visit_id_start=10)
+        + [
+            make_visit_row(조제판매ID=1, 고객ID=1, 내방일="2024-01-01", 처방조제일수=20, 투약일수=20),
+            make_visit_row(조제판매ID=2, 고객ID=1, 내방일="2024-01-25", 차상위대상자="Y", 보험구분=None),
+            make_visit_row(조제판매ID=3, 고객ID=1, 내방일="2024-03-10", 다음내방일="2024-04-09"),
+        ]
+    )
+    feature_cols = [col for col in MART1_COLUMNS if col not in MART1_NON_FEATURE_COLS]
+
+    training_set = build_mart1_training_set(raw_visits)
+
+    # Before the high-frequency filler visits (dated 2024-01-01) exist,
+    # build_marts' as-of top-2 exclusion can swallow drug 101 and customer 1
+    # isn't Chronic yet, so there's no snapshot row to compare against.
+    comparable = training_set[training_set[SNAPSHOT_DATE_COL] >= pd.Timestamp("2024-01-01")]
+    assert comparable[SNAPSHOT_DATE_COL].nunique() > 5
+    for snapshot_date, rows in comparable.groupby(SNAPSHOT_DATE_COL):
+        mart1, _, _ = build_marts(raw_visits, snapshot_date)
+        expected = mart1.set_index("고객ID").loc[rows["고객ID"], feature_cols]
+        pd.testing.assert_frame_equal(rows.set_index("고객ID")[feature_cols], expected)
+
+
+def test_x_features_have_lightgbm_ready_dtypes():
+    raw_visits = make_raw_visits(make_high_frequency_filler_visits() + _chronic_customer_history())
+
+    training_set = build_mart1_training_set(raw_visits)
+
+    for col in MART1_NUMERIC_FEATURE_COLS:
+        assert training_set[col].dtype == "float64", col
+    for col in MART1_BOOLEAN_FEATURE_COLS:
+        assert training_set[col].dtype == "boolean", col
 
 def _training_set_with_dates(dates: list) -> pd.DataFrame:
     return pd.DataFrame({SNAPSHOT_DATE_COL: pd.to_datetime(dates)})
