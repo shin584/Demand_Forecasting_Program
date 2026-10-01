@@ -284,3 +284,55 @@ def test_split_columns_match_input_columns():
     assert list(split.train.columns) == MART1_TRAINING_COLUMNS
     assert list(split.val.columns) == MART1_TRAINING_COLUMNS
     assert list(split.test.columns) == MART1_TRAINING_COLUMNS
+
+
+def test_no_negative_row_has_a_visit_on_the_day_after_its_snapshot_date():
+    # 처방조제일수=33 on V2/V3 samples days 30/31/32 of each cycle, and V4
+    # (2024-04-20) comes 31 days after V3 -- so V3's day-30 sample is the day
+    # before V4, a mislabelled negative without a next-visit bound.
+    raw_visits = make_raw_visits(
+        make_high_frequency_filler_visits(_FILLER_OCCURRENCES)
+        + [
+            {**row, "처방조제일수": 33} if row["조제판매ID"] in (2, 3) else row
+            for row in _chronic_customer_history()
+        ]
+    )
+
+    training_set = build_mart1_training_set(raw_visits)
+
+    visit_dates = set(raw_visits.loc[raw_visits["고객ID"] == 1, "내방일"])
+    negatives = training_set[training_set["내일_방문"] == False]  # noqa: E712
+    next_days = negatives["기준일자"] + pd.Timedelta(days=1)
+    assert not negatives.empty
+    assert not next_days.isin(visit_dates).any()
+
+
+def test_no_row_is_dated_on_or_after_the_extracts_last_visit():
+    raw_visits = make_raw_visits(make_high_frequency_filler_visits(_FILLER_OCCURRENCES) + _chronic_customer_history())
+
+    training_set = build_mart1_training_set(raw_visits)
+
+    assert training_set["기준일자"].max() < raw_visits["내방일"].max()
+
+
+def test_a_sample_on_or_after_the_extracts_last_visit_is_dropped(monkeypatch):
+    # Negative Sampling never dates a row that late today; this pins the
+    # guard for a future sampling change that would (a row dated on the last
+    # 내방일 has its label on the day after the extract ends).
+    import pipeline.marts as marts
+
+    raw_visits = make_raw_visits(make_high_frequency_filler_visits(_FILLER_OCCURRENCES) + _chronic_customer_history())
+    real_sampler = marts.sample_mart1_negatives
+
+    def sampler_with_late_rows(raw_visits, chronic_customer_ids=None):
+        negatives = real_sampler(raw_visits, chronic_customer_ids)
+        late = negatives.iloc[[0, 0]].assign(
+            기준일자=[pd.Timestamp("2024-04-20"), pd.Timestamp("2024-04-25")]
+        )
+        return pd.concat([negatives, late], ignore_index=True)
+
+    monkeypatch.setattr(marts, "sample_mart1_negatives", sampler_with_late_rows)
+
+    training_set = build_mart1_training_set(raw_visits)
+
+    assert training_set["기준일자"].max() < pd.Timestamp("2024-04-20")

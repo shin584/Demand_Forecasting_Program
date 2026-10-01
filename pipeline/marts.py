@@ -326,6 +326,8 @@ def build_mart1_training_set(
     and only if its customer isn't Lapsed as of that date -- their latest
     visit on or before it is at most `lapse_horizon_days` earlier (see
     `_is_within_lapse_horizon`), the same population `build_marts` scores.
+    A row dated on or after the extract's last 내방일 is dropped too: its
+    label (a visit on 기준일자 + 1) falls outside the data.
     학습_가중치 tiers are still derived once from the full, unfiltered
     `raw_visits`: the weight only scales a row's loss and is never a model
     input, so it can't leak into predictions. The point, anchoring,
@@ -353,7 +355,12 @@ def build_mart1_training_set(
     is_chronic_as_of_row = (
         samples[SNAPSHOT_DATE_COL] >= samples[CUSTOMER_ID_COL].map(chronic_since)
     )
-    samples = samples[is_chronic_as_of_row].reset_index(drop=True)
+    # A row's Next-Day label is only observable while 기준일자 + 1 is still
+    # inside the extract, so nothing is dated on or after its last 내방일 --
+    # which also keeps split_mart1_training_set's windows (and the
+    # backtest's default test dates) from running past the data.
+    is_labelled = samples[SNAPSHOT_DATE_COL] < pd.to_datetime(raw_visits[VISIT_DATE_COL]).max()
+    samples = samples[is_chronic_as_of_row & is_labelled].reset_index(drop=True)
 
     result = samples.join(
         _mart1_x_features(raw_visits, samples[CUSTOMER_ID_COL], samples[SNAPSHOT_DATE_COL])
@@ -711,10 +718,14 @@ def sample_mart1_negatives(
     offsets are sampled within.
 
     One row per (anchoring visit, sampled offset), dated that visit's own
-    내방일 plus the offset. A customer's chronologically last known visit
-    never anchors a cycle - it has no later visit, so there's nothing to
-    bound the sampling window with, and it's what supplies the "1 assumed
-    positive per cycle" that the accepted ~1:5 ratio is measured against.
+    내방일 plus the offset, kept only if it's at least two days before the
+    anchoring visit's next visit (the customer's earliest visit on a later
+    date): a sample on the day before it would actually be a Next-Day Visit
+    positive, and one on or after it describes a cycle that's already over.
+    That bound is what makes the Y=0 label true, not just assumed. A
+    customer's chronologically last known visit date never anchors a cycle -
+    it has no later visit, so there's nothing to bound the sampling window
+    with.
     `chronic_customer_ids` can be passed in to reuse a result already
     computed by `build_marts`; otherwise it's derived here via
     `revisit_match`.
@@ -736,11 +747,21 @@ def sample_mart1_negatives(
     visits = visits[visits[CUSTOMER_ID_COL].isin(chronic_customer_ids)]
 
     # Customers in first-appearance order, each customer's visits
-    # chronological (stable, so same-day visits keep their relative order),
-    # minus that customer's last visit.
-    visits = visits.assign(_customer_order=pd.factorize(visits[CUSTOMER_ID_COL])[0])
+    # chronological (stable, so same-day visits keep their relative order).
+    visits = visits.assign(
+        _customer_order=pd.factorize(visits[CUSTOMER_ID_COL])[0],
+        **{VISIT_DATE_COL: pd.to_datetime(visits[VISIT_DATE_COL])},
+    )
     visits = visits.sort_values(["_customer_order", VISIT_DATE_COL], kind="stable")
-    anchors = visits[visits.duplicated(CUSTOMER_ID_COL, keep="last")].reset_index(drop=True)
+    # Each visit's next visit: the customer's earliest visit on a strictly
+    # later date (a same-day visit isn't one). Visits on a customer's last
+    # date have none and anchor nothing.
+    visit_days = visits[[CUSTOMER_ID_COL, VISIT_DATE_COL]].drop_duplicates()
+    visit_days = visit_days.assign(
+        _next_visit_date=visit_days.groupby(CUSTOMER_ID_COL)[VISIT_DATE_COL].shift(-1)
+    )
+    anchors = visits.merge(visit_days, on=[CUSTOMER_ID_COL, VISIT_DATE_COL], how="left")
+    anchors = anchors[anchors["_next_visit_date"].notna()].reset_index(drop=True)
 
     # negative_sample_offsets, vectorized: np.rint rounds half-to-even exactly
     # like the built-in round() it uses.
@@ -764,16 +785,19 @@ def sample_mart1_negatives(
         .sort_values(["_anchor", "_offset"], kind="stable")
     )
     anchor_rows = anchors.loc[samples["_anchor"]].reset_index(drop=True)
+    snapshot_dates = anchor_rows[VISIT_DATE_COL] + pd.to_timedelta(
+        samples["_offset"].to_numpy(), unit="D"
+    )
+    is_true_negative = snapshot_dates < anchor_rows["_next_visit_date"] - pd.Timedelta(days=1)
     return pd.DataFrame(
         {
             CUSTOMER_ID_COL: anchor_rows[CUSTOMER_ID_COL],
             VISIT_ID_COL: anchor_rows[VISIT_ID_COL],
-            SNAPSHOT_DATE_COL: pd.to_datetime(anchor_rows[VISIT_DATE_COL])
-            + pd.to_timedelta(samples["_offset"].to_numpy(), unit="D"),
+            SNAPSHOT_DATE_COL: snapshot_dates,
             NEXT_DAY_VISIT_COL: False,
         },
         columns=MART1_NEGATIVE_SAMPLE_COLUMNS,
-    )
+    )[is_true_negative].reset_index(drop=True)
 
 
 def _mart1_positive_samples(raw_visits: pd.DataFrame, chronic_customer_ids: set) -> pd.DataFrame:

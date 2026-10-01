@@ -138,3 +138,76 @@ def test_negative_to_positive_ratio_is_approximately_1_to_5_across_a_dataset():
     assert len(negatives) == 5 * len(cycles)
     ratio = total_positives / len(negatives)
     assert ratio == 1 / 5
+
+
+def _two_visit_chronic_customer(prescription_days, next_visit_date):
+    # Customer 1: Chronic via a genuine Revisit Match (same drug, next visit
+    # inside the first visit's 다음내방일 +/-30 day window), anchoring one
+    # cycle from 2024-01-01 to `next_visit_date`.
+    return make_raw_visits(
+        make_high_frequency_filler_visits()
+        + [
+            make_visit_row(
+                조제판매ID=1,
+                고객ID=1,
+                내방일="2024-01-01",
+                처방조제일수=prescription_days,
+                다음내방일=next_visit_date,
+                약품ID=1,
+            ),
+            make_visit_row(조제판매ID=2, 고객ID=1, 내방일=next_visit_date, 약품ID=1),
+        ]
+    )
+
+
+def test_in_cycle_negatives_on_or_after_the_next_visit_are_dropped():
+    # 처방조제일수=90 puts samples at days 14/45/81/84/86, but the customer
+    # comes back early on day 50: the late samples describe a cycle that has
+    # already ended.
+    raw_visits = _two_visit_chronic_customer(90, "2024-02-20")
+
+    negatives = sample_mart1_negatives(raw_visits)
+
+    assert set(negatives["기준일자"]) == {
+        pd.Timestamp("2024-01-15"),
+        pd.Timestamp("2024-02-15"),
+    }
+
+
+def test_no_negative_is_sampled_the_day_before_the_next_visit():
+    # 처방조제일수=100 puts samples at days 15/50/90/93/96. The next visit is
+    # on day 94, so the day-93 sample's customer actually visits on
+    # 기준일자 + 1 -- its true Next-Day label is Y=1, not a negative.
+    raw_visits = _two_visit_chronic_customer(100, "2024-04-04")
+
+    negatives = sample_mart1_negatives(raw_visits)
+
+    assert pd.Timestamp("2024-04-03") not in set(negatives["기준일자"])
+    assert set(negatives["기준일자"]) == {
+        pd.Timestamp("2024-01-16"),
+        pd.Timestamp("2024-02-20"),
+        pd.Timestamp("2024-03-31"),
+    }
+
+
+def test_same_day_visits_are_bounded_by_the_next_later_visit_date():
+    # Two visits on 2024-01-01 (the first's next row is same-day, not a
+    # later visit): both are bounded by the 2024-02-20 visit, and the
+    # same-day visits on the customer's last date anchor nothing.
+    raw_visits = make_raw_visits(
+        make_high_frequency_filler_visits()
+        + [
+            make_visit_row(
+                조제판매ID=1, 고객ID=1, 내방일="2024-01-01", 처방조제일수=90,
+                다음내방일="2024-02-20", 약품ID=1,
+            ),
+            make_visit_row(조제판매ID=2, 고객ID=1, 내방일="2024-01-01", 처방조제일수=90, 약품ID=3),
+            make_visit_row(조제판매ID=3, 고객ID=1, 내방일="2024-02-20", 처방조제일수=90, 약품ID=1),
+            make_visit_row(조제판매ID=4, 고객ID=1, 내방일="2024-02-20", 처방조제일수=90, 약품ID=3),
+        ]
+    )
+
+    negatives = sample_mart1_negatives(raw_visits)
+
+    assert set(negatives["조제판매ID"]) == {1, 2}
+    assert negatives["기준일자"].max() < pd.Timestamp("2024-02-19")
