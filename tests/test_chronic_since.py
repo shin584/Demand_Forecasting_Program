@@ -121,7 +121,9 @@ def test_build_marts_not_chronic_the_day_before_the_chronic_since_date():
 def test_build_marts_chronic_on_and_after_the_chronic_since_date():
     raw_visits = _single_pair_visits()
 
-    for as_of_date in ["2024-02-15", "2024-02-16", "2024-12-31"]:
+    # Every date stays within the Lapse Horizon of the 2024-02-15 visit; past
+    # it, see test_lapse_horizon.py.
+    for as_of_date in ["2024-02-15", "2024-02-16", "2024-08-01"]:
         result = build_marts(raw_visits, as_of_date=as_of_date, rare_drug_patient_threshold=1)
 
         assert 1 in set(result.mart1["고객ID"]), as_of_date

@@ -25,6 +25,7 @@ from .marts import (
     CUSTOMER_ID_COL,
     DRUG_ID_COL,
     DRUG_NAME_COL,
+    LAPSE_HORIZON_DAYS,
     MART2_VALUE_COL,
     MART3_BUCKET_MIN_OBSERVATIONS,
     MART3_SEASON_MIN_OBSERVATIONS,
@@ -85,6 +86,7 @@ def run_track1_inference(
     model,
     chronic_visit_prob_cutoff: float = CHRONIC_VISIT_PROB_CUTOFF,
     rare_drug_patient_threshold: int = RARE_DRUG_PATIENT_THRESHOLD,
+    lapse_horizon_days: int = LAPSE_HORIZON_DAYS,
 ) -> Track1Result:
     """Scores every Chronic customer in `build_marts`'s Mart 1 snapshot for
     `as_of_date` and returns the pharmacist Visit List alongside Track 1's
@@ -97,7 +99,8 @@ def run_track1_inference(
     (`pipeline.model.prepare_track1_features`), so train/inference can't drift.
 
     Every customer in the snapshot is scored -- no pre-filtering beyond Mart
-    1's own Chronic population (see `build_marts`). The Visit List
+    1's own population: Chronic customers not Lapsed past
+    `lapse_horizon_days` (see `build_marts`). The Visit List
     (`VISIT_LIST_COLUMNS`: 기준일자, 고객ID, 예측방문확률) contains exactly the
     customers whose predicted probability is `>= chronic_visit_prob_cutoff`;
     `scored_population` (`SCORED_POPULATION_COLUMNS`) is every scored
@@ -119,7 +122,9 @@ def run_track1_inference(
     customer's contribution down rather than needing a hard cutoff.
     """
     as_of_date = pd.Timestamp(as_of_date)
-    mart1, mart2, _mart3 = build_marts(raw_visits, as_of_date)
+    mart1, mart2, _mart3 = build_marts(
+        raw_visits, as_of_date, lapse_horizon_days=lapse_horizon_days
+    )
     return _track1_from_marts(
         mart1,
         mart2,
@@ -260,6 +265,7 @@ def run_daily_forecast(
     mart3_bucket_min_observations: int = MART3_BUCKET_MIN_OBSERVATIONS,
     mart3_season_min_observations: int = MART3_SEASON_MIN_OBSERVATIONS,
     rare_drug_patient_threshold: int = RARE_DRUG_PATIENT_THRESHOLD,
+    lapse_horizon_days: int = LAPSE_HORIZON_DAYS,
 ) -> ForecastResult:
     """The full daily forecast: Track 1's Visit List and per-drug demand
     (`run_track1_inference`) combined with Track 2's Mart 3 lookup into the
@@ -272,6 +278,8 @@ def run_daily_forecast(
     Chronic-population rare-drug allocation override (see CONTEXT.md
     "Decision Thresholds (provisional)" and docs/adr/0004) -- one shared
     threshold *value*, applied independently to each track's own population.
+    `lapse_horizon_days` is forwarded to `build_marts` and only narrows
+    Track 1's Mart 1 population (see `run_track1_inference`).
 
     `order_quantities` (`ORDER_QUANTITY_COLUMNS`: 기준일자, 약품ID, 약품명,
     track1_기댓값, track2_통계값, 최종발주량) is the union of every drug
@@ -283,13 +291,14 @@ def run_daily_forecast(
     as_of_date = pd.Timestamp(as_of_date)
     # One snapshot serves both tracks: the Mart 3 thresholds passed here
     # don't touch Mart 1/Mart 2, so Track 1 sees exactly what its own
-    # default-threshold `build_marts` call would have built.
+    # `build_marts` call (same `lapse_horizon_days`) would have built.
     mart1, mart2, mart3 = build_marts(
         raw_visits,
         as_of_date,
-        mart3_bucket_min_observations,
-        mart3_season_min_observations,
-        rare_drug_patient_threshold,
+        mart3_bucket_min_observations=mart3_bucket_min_observations,
+        mart3_season_min_observations=mart3_season_min_observations,
+        rare_drug_patient_threshold=rare_drug_patient_threshold,
+        lapse_horizon_days=lapse_horizon_days,
     )
     track1 = _track1_from_marts(
         mart1,

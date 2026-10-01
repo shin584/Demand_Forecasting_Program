@@ -174,6 +174,15 @@ MART3_SEASON_MIN_OBSERVATIONS = 15
 # tunable "rare" definition.
 RARE_DRUG_PATIENT_THRESHOLD = 5
 
+# The Lapse Horizon (see CONTEXT.md "Lapsed Chronic Patient" and
+# docs/adr/0005-lapse-aware-track1-population-and-evaluation.md): a Chronic
+# customer whose latest visit is more than this many days before a snapshot
+# date is Lapsed as of it -- still Chronic (so still out of Mart 3), but
+# outside Track 1's population, both in `build_marts`'s Mart 1 snapshot and
+# in every Mart 1 Training Set row. Provisional, like the other Decision
+# Thresholds.
+LAPSE_HORIZON_DAYS = 180
+
 # Mart 1's X-features anchored to each customer's most recent visit at or
 # before as_of_date (see _anchoring_visit_features) -- shared by that
 # function's output columns and _attach_mart1_x_features' join loop.
@@ -251,6 +260,7 @@ def build_marts(
     mart3_bucket_min_observations: int = MART3_BUCKET_MIN_OBSERVATIONS,
     mart3_season_min_observations: int = MART3_SEASON_MIN_OBSERVATIONS,
     rare_drug_patient_threshold: int = RARE_DRUG_PATIENT_THRESHOLD,
+    lapse_horizon_days: int = LAPSE_HORIZON_DAYS,
 ) -> MartResult:
     """Build Mart 1/2/3 from raw visit-level rows, as of a given snapshot date.
 
@@ -277,11 +287,14 @@ def build_marts(
     3's sparse-bucket backoff thresholds (see `resolve_mart3_backoff`).
     `rare_drug_patient_threshold` (default `RARE_DRUG_PATIENT_THRESHOLD`)
     excludes drugs with too few patients from Mart 3 entirely (see
-    `_build_mart3`).
+    `_build_mart3`). `lapse_horizon_days` (default `LAPSE_HORIZON_DAYS`)
+    drops Lapsed Chronic customers -- latest visit more than that many days
+    before `as_of_date` -- from Mart 1 only; they stay Chronic, so Mart 3
+    still excludes them.
     """
     as_of_date = pd.Timestamp(as_of_date)
     chronic_customer_ids = _chronic_customer_ids_as_of(chronic_since_dates(raw_visits), as_of_date)
-    mart1 = _build_mart1(raw_visits, as_of_date, chronic_customer_ids)
+    mart1 = _build_mart1(raw_visits, as_of_date, chronic_customer_ids, lapse_horizon_days)
     mart2 = _build_mart2(raw_visits, as_of_date)
     mart3 = _build_mart3(
         raw_visits,
@@ -294,7 +307,9 @@ def build_marts(
     return MartResult(mart1=mart1, mart2=mart2, mart3=mart3)
 
 
-def build_mart1_training_set(raw_visits: pd.DataFrame) -> pd.DataFrame:
+def build_mart1_training_set(
+    raw_visits: pd.DataFrame, lapse_horizon_days: int = LAPSE_HORIZON_DAYS
+) -> pd.DataFrame:
     """Mart 1's full historical training set: one row per Next-Day Visit
     positive (see `_mart1_positive_samples`) plus one row per
     `sample_mart1_negatives` Y=0 sample, each with X-features and
@@ -307,7 +322,10 @@ def build_mart1_training_set(raw_visits: pd.DataFrame) -> pd.DataFrame:
     is on or after its customer's Chronic-since Date (see
     `chronic_since_dates` and
     docs/adr/0005-lapse-aware-track1-population-and-evaluation.md, which
-    supersedes the full-history shortcut docs/adr/0002 once allowed here).
+    supersedes the full-history shortcut docs/adr/0002 once allowed here),
+    and only if its customer isn't Lapsed as of that date -- their latest
+    visit on or before it is at most `lapse_horizon_days` earlier (see
+    `_is_within_lapse_horizon`), the same population `build_marts` scores.
     학습_가중치 tiers are still derived once from the full, unfiltered
     `raw_visits`: the weight only scales a row's loss and is never a model
     input, so it can't leak into predictions. The point, anchoring,
@@ -317,8 +335,8 @@ def build_mart1_training_set(raw_visits: pd.DataFrame) -> pd.DataFrame:
     snapshot date.
 
     Returns an empty `MART1_TRAINING_COLUMNS`-shaped frame if `raw_visits`
-    has no Chronic Patients at all, or if every sampled row predates its
-    customer's Chronic-since Date.
+    has no Chronic Patients at all, or if no sampled row is both on or after
+    its customer's Chronic-since Date and within the Lapse Horizon.
     """
     chronic_since = chronic_since_dates(raw_visits)
     chronic_customer_ids = set(chronic_since.index)
@@ -340,6 +358,7 @@ def build_mart1_training_set(raw_visits: pd.DataFrame) -> pd.DataFrame:
     result = samples.join(
         _mart1_x_features(raw_visits, samples[CUSTOMER_ID_COL], samples[SNAPSHOT_DATE_COL])
     )
+    result = result[_is_within_lapse_horizon(result, lapse_horizon_days)].reset_index(drop=True)
     # Derived solely from Revisit Match, same as _build_mart1 -- every row
     # here is already restricted to chronic_customer_ids.
     result[CHRONIC_COL] = True
@@ -787,7 +806,10 @@ def _mart1_positive_samples(raw_visits: pd.DataFrame, chronic_customer_ids: set)
 
 
 def _build_mart1(
-    raw_visits: pd.DataFrame, as_of_date: pd.Timestamp, chronic_customer_ids: set
+    raw_visits: pd.DataFrame,
+    as_of_date: pd.Timestamp,
+    chronic_customer_ids: set,
+    lapse_horizon_days: int = LAPSE_HORIZON_DAYS,
 ) -> pd.DataFrame:
     # Only Chronic Patients (per Revisit Match) belong to Mart 1; Acute
     # patients' visits are excluded here and become part of Mart 3's
@@ -820,10 +842,20 @@ def _build_mart1(
     mart1 = mart1.join(
         _mart1_x_features(raw_visits, customers, pd.Series(as_of_date, index=customers.index))
     )
+    mart1 = mart1[_is_within_lapse_horizon(mart1, lapse_horizon_days)].reset_index(drop=True)
     mart1 = _attach_mart1_weight(
         mart1, _visits_at_or_before(raw_visits, as_of_date), chronic_customer_ids
     )
     return mart1[MART1_COLUMNS]
+
+
+def _is_within_lapse_horizon(mart1_rows: pd.DataFrame, lapse_horizon_days: int) -> pd.Series:
+    """True for each Mart 1 row whose customer isn't Lapsed as of the row's
+    snapshot date: their Anchoring Visit is at most `lapse_horizon_days`
+    before it. Reads 마지막방문_경과일, which is exactly the days since the
+    Anchoring Visit (see `_anchoring_visit_features`); a row with no
+    Anchoring Visit has no recent visit either, so it's out too."""
+    return mart1_rows[DAYS_SINCE_LAST_VISIT_COL] <= lapse_horizon_days
 
 
 def _mart1_x_features(
