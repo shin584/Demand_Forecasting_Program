@@ -302,26 +302,26 @@ def build_mart1_training_set(raw_visits: pd.DataFrame) -> pd.DataFrame:
     `build_marts`, which builds a single as_of_date snapshot meant for daily
     inference/backtesting one day at a time.
 
-    Chronic/Acute classification and 학습_가중치 tiers are derived once from
-    the full, unfiltered `raw_visits`, not re-derived per row's own snapshot
-    date -- the same live/full-history-by-default behavior
-    `sample_mart1_weights` and `sample_mart1_negatives` already have when
-    called directly (see docs/adr/0002-point-in-time-correctness.md, "Update
-    (implementing #11)"): re-running Revisit Match per distinct historical
-    snapshot date across a full training set would be prohibitively
-    expensive, and which customers are Chronic/severe is being treated here
-    as a population-membership decision for the training set as a whole, not
-    a per-row leakage-sensitive X-feature. Only the point, anchoring,
-    family-total, and MPR/no-show X-features -- the ones point-in-time
-    correctness actually protects (see CONTEXT.md "Point-in-Time
-    Correctness") -- are computed as of each row's own snapshot date, by the
-    same `_mart1_x_features` `build_marts` uses, in one vectorized pass over
-    every row rather than once per distinct snapshot date.
+    Chronic membership is as-of-correct per row, the same rule `build_marts`
+    applies: a row, positive or negative, is kept only if its snapshot date
+    is on or after its customer's Chronic-since Date (see
+    `chronic_since_dates` and
+    docs/adr/0005-lapse-aware-track1-population-and-evaluation.md, which
+    supersedes the full-history shortcut docs/adr/0002 once allowed here).
+    학습_가중치 tiers are still derived once from the full, unfiltered
+    `raw_visits`: the weight only scales a row's loss and is never a model
+    input, so it can't leak into predictions. The point, anchoring,
+    family-total, and MPR/no-show X-features are computed as of each row's
+    own snapshot date, by the same `_mart1_x_features` `build_marts` uses, in
+    one vectorized pass over every row rather than once per distinct
+    snapshot date.
 
     Returns an empty `MART1_TRAINING_COLUMNS`-shaped frame if `raw_visits`
-    has no Chronic Patients at all.
+    has no Chronic Patients at all, or if every sampled row predates its
+    customer's Chronic-since Date.
     """
-    chronic_customer_ids = _chronic_customer_ids(raw_visits)
+    chronic_since = chronic_since_dates(raw_visits)
+    chronic_customer_ids = set(chronic_since.index)
     if not chronic_customer_ids:
         return pd.DataFrame(columns=MART1_TRAINING_COLUMNS)
 
@@ -332,6 +332,10 @@ def build_mart1_training_set(raw_visits: pd.DataFrame) -> pd.DataFrame:
         ],
         ignore_index=True,
     )
+    is_chronic_as_of_row = (
+        samples[SNAPSHOT_DATE_COL] >= samples[CUSTOMER_ID_COL].map(chronic_since)
+    )
+    samples = samples[is_chronic_as_of_row].reset_index(drop=True)
 
     result = samples.join(
         _mart1_x_features(raw_visits, samples[CUSTOMER_ID_COL], samples[SNAPSHOT_DATE_COL])
@@ -600,7 +604,9 @@ def sample_mart1_weights(
     both `build_marts`'s single-snapshot mart1 output (given as-of-filtered
     `raw_visits`, so severity status is as-of-correct, and its as-of
     Chronic population) and `build_mart1_training_set`'s historical rows (given the full,
-    unfiltered `raw_visits` -- see that function's docstring for why).
+    unfiltered `raw_visits` for the weight tiers only -- its rows themselves
+    are already filtered by Chronic-since Date; see that function's
+    docstring for why).
     """
     if chronic_customer_ids is None:
         chronic_customer_ids = _chronic_customer_ids(raw_visits)
@@ -1097,9 +1103,10 @@ def _attach_mart1_weight(
     chronic tiers derived from: `_build_mart1` passes in the as-of-filtered
     visits alongside its as-of Chronic population, keeping `build_marts`'s
     snapshot fully point-in-time correct; `build_mart1_training_set`
-    passes in the full, unfiltered table, matching `sample_mart1_weights`'s
-    own live/full-history-by-default behavior when called directly (see its
-    docstring).
+    passes in the full, unfiltered table for the weight tiers only (its rows
+    are already filtered by Chronic-since Date), matching
+    `sample_mart1_weights`'s own live/full-history-by-default behavior when
+    called directly (see its docstring).
     """
     weights = sample_mart1_weights(raw_visits, chronic_customer_ids)
     mart1 = mart1.copy()

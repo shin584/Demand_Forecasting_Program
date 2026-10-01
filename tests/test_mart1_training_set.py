@@ -20,9 +20,15 @@ from pipeline.marts import (
 )
 
 
+# _chronic_customer_history uses drug 1 on 4 visits; the filler drugs need
+# more occurrences than that to stay the top-2 Revisit Match exclusion.
+_FILLER_OCCURRENCES = 5
+
+
 def _chronic_customer_history():
     # Customer 1: Chronic via a genuine Revisit Match (V2 falls within V1's
-    # 다음내방일 +/-30 day window and shares a drug).
+    # 다음내방일 +/-30 day window and shares a drug), so Chronic since V2's
+    # 2024-02-15. V3 and V4 give the training set rows dated after that.
     return [
         make_visit_row(
             조제판매ID=1,
@@ -32,7 +38,13 @@ def _chronic_customer_history():
             처방조제일수=30,
             약품ID=1,
         ),
-        make_visit_row(조제판매ID=2, 고객ID=1, 내방일="2024-02-15", 약품ID=1),
+        make_visit_row(
+            조제판매ID=2, 고객ID=1, 내방일="2024-02-15", 다음내방일="2024-03-16", 약품ID=1
+        ),
+        make_visit_row(
+            조제판매ID=3, 고객ID=1, 내방일="2024-03-20", 다음내방일="2024-04-19", 약품ID=1
+        ),
+        make_visit_row(조제판매ID=4, 고객ID=1, 내방일="2024-04-20", 약품ID=1),
     ]
 
 
@@ -47,7 +59,7 @@ def test_returns_empty_frame_when_no_chronic_patients():
 
 
 def test_columns_match_mart1_training_columns():
-    raw_visits = make_raw_visits(make_high_frequency_filler_visits() + _chronic_customer_history())
+    raw_visits = make_raw_visits(make_high_frequency_filler_visits(_FILLER_OCCURRENCES) + _chronic_customer_history())
 
     training_set = build_mart1_training_set(raw_visits)
 
@@ -55,67 +67,123 @@ def test_columns_match_mart1_training_columns():
     assert not training_set.empty
 
 
-def test_one_positive_row_per_actual_visit():
-    raw_visits = make_raw_visits(make_high_frequency_filler_visits() + _chronic_customer_history())
+def test_one_positive_row_per_actual_visit_from_the_chronic_since_date():
+    raw_visits = make_raw_visits(make_high_frequency_filler_visits(_FILLER_OCCURRENCES) + _chronic_customer_history())
 
     training_set = build_mart1_training_set(raw_visits)
 
     positives = training_set[training_set["내일_방문"] == True]  # noqa: E712
-    # One positive per real visit, dated the calendar day right before it.
+    # One positive per real visit, dated the calendar day right before it --
+    # except V1's (2023-12-31) and V2's (2024-02-14), which fall before the
+    # 2024-02-15 Chronic-since Date.
     assert set(positives["기준일자"]) == {
-        pd.Timestamp("2023-12-31"),
-        pd.Timestamp("2024-02-14"),
+        pd.Timestamp("2024-03-19"),
+        pd.Timestamp("2024-04-19"),
     }
 
 
-def test_negative_rows_match_sample_mart1_negatives():
-    raw_visits = make_raw_visits(make_high_frequency_filler_visits() + _chronic_customer_history())
+def test_negative_rows_match_sample_mart1_negatives_from_the_chronic_since_date():
+    raw_visits = make_raw_visits(make_high_frequency_filler_visits(_FILLER_OCCURRENCES) + _chronic_customer_history())
 
     training_set = build_mart1_training_set(raw_visits)
-    expected_negative_dates = set(sample_mart1_negatives(raw_visits, {1})["기준일자"])
+    sampled_dates = sample_mart1_negatives(raw_visits, {1})["기준일자"]
+    expected_negative_dates = set(sampled_dates[sampled_dates >= pd.Timestamp("2024-02-15")])
 
     negatives = training_set[training_set["내일_방문"] == False]  # noqa: E712
     assert set(negatives["기준일자"]) == expected_negative_dates
     assert len(negatives) == len(expected_negative_dates)
 
 
-def test_weight_uses_the_full_raw_visits_not_as_of_filtered():
-    # Severity flag sits on the customer's only-ever visit, so this is really
-    # exercising that build_mart1_training_set's weight wiring reaches
-    # sample_mart1_weights at all - not that it's as-of filtered (unlike
-    # build_marts, it deliberately isn't, see the function's docstring).
+def test_rows_before_the_chronic_since_date_are_dropped():
+    # Customer 1 visits in October (drug 2, never recurs) and January before
+    # V2's 2024-02-15 match makes them Chronic. Not Chronic yet as of those
+    # earlier dates, so no row of either kind dated before it belongs.
     raw_visits = make_raw_visits(
-        make_high_frequency_filler_visits()
+        make_high_frequency_filler_visits(_FILLER_OCCURRENCES)
         + [
             make_visit_row(
-                조제판매ID=1,
-                고객ID=1,
-                내방일="2024-01-01",
-                다음내방일="2024-01-31",
-                처방조제일수=30,
-                약품ID=1,
-                중증암등록대상자="Y",
-            ),
-            make_visit_row(조제판매ID=2, 고객ID=1, 내방일="2024-02-15", 약품ID=1),
+                조제판매ID=10, 고객ID=1, 내방일="2023-10-01", 다음내방일="2023-10-31", 약품ID=2
+            )
         ]
+        + _chronic_customer_history()
+    )
+    sampled = sample_mart1_negatives(raw_visits, {1})
+
+    training_set = build_mart1_training_set(raw_visits)
+
+    assert (training_set[SNAPSHOT_DATE_COL] >= pd.Timestamp("2024-02-15")).all()
+    # Negatives anchored on the October and January visits are gone; those
+    # anchored on V2 and V3 are all kept.
+    negatives = training_set[training_set["내일_방문"] == False]  # noqa: E712
+    kept_anchors = sampled[sampled["조제판매ID"].isin([2, 3])]
+    assert sorted(negatives[SNAPSHOT_DATE_COL]) == sorted(kept_anchors[SNAPSHOT_DATE_COL])
+    positives = training_set[training_set["내일_방문"] == True]  # noqa: E712
+    assert set(positives[SNAPSHOT_DATE_COL]) == {
+        pd.Timestamp("2024-03-19"),
+        pd.Timestamp("2024-04-19"),
+    }
+
+
+def test_returns_empty_frame_when_every_row_predates_the_chronic_since_date():
+    # The match is only observed on the customer's last visit: every positive
+    # is dated the day before a visit, and no negative is anchored on the
+    # last visit, so nothing is left on or after 2024-02-15.
+    raw_visits = make_raw_visits(make_high_frequency_filler_visits(_FILLER_OCCURRENCES) + _chronic_customer_history()[:2])
+
+    training_set = build_mart1_training_set(raw_visits)
+
+    assert training_set.empty
+    assert list(training_set.columns) == MART1_TRAINING_COLUMNS
+
+
+def test_each_customer_is_filtered_by_their_own_chronic_since_date():
+    # Customer 2 is Chronic from 2024-04-15, two months after customer 1.
+    customer_2 = [
+        make_visit_row(
+            조제판매ID=20, 고객ID=2, 가족ID=2, 내방일="2024-03-01", 다음내방일="2024-03-31", 약품ID=3
+        ),
+        make_visit_row(
+            조제판매ID=21, 고객ID=2, 가족ID=2, 내방일="2024-04-15", 다음내방일="2024-05-15", 약품ID=3
+        ),
+        make_visit_row(조제판매ID=22, 고객ID=2, 가족ID=2, 내방일="2024-05-20", 약품ID=3),
+    ]
+    raw_visits = make_raw_visits(
+        make_high_frequency_filler_visits(_FILLER_OCCURRENCES) + _chronic_customer_history() + customer_2
     )
 
     training_set = build_mart1_training_set(raw_visits)
 
+    earliest = training_set.groupby("고객ID")[SNAPSHOT_DATE_COL].min()
+    assert earliest.loc[1] < pd.Timestamp("2024-04-15")
+    assert earliest.loc[1] >= pd.Timestamp("2024-02-15")
+    assert earliest.loc[2] >= pd.Timestamp("2024-04-15")
+
+
+def test_weight_uses_the_full_raw_visits_not_as_of_filtered():
+    # Severity flag sits only on the customer's first visit, so this is
+    # really exercising that build_mart1_training_set's weight wiring reaches
+    # sample_mart1_weights at all - not that it's as-of filtered (unlike
+    # build_marts, it deliberately isn't, see the function's docstring).
+    history = _chronic_customer_history()
+    history[0]["중증암등록대상자"] = "Y"
+    raw_visits = make_raw_visits(make_high_frequency_filler_visits(_FILLER_OCCURRENCES) + history)
+
+    training_set = build_mart1_training_set(raw_visits)
+
+    assert not training_set.empty
     assert (training_set["학습_가중치"] == 3.0).all()
 
 
 def test_x_features_are_computed_as_of_each_rows_own_snapshot_date():
-    raw_visits = make_raw_visits(make_high_frequency_filler_visits() + _chronic_customer_history())
+    raw_visits = make_raw_visits(make_high_frequency_filler_visits(_FILLER_OCCURRENCES) + _chronic_customer_history())
 
     training_set = build_mart1_training_set(raw_visits).set_index("기준일자")
 
-    # As of 2023-12-31 (the day before V1), customer 1 has no anchoring
-    # visit yet - must not see V1 itself, dated the very next day.
-    assert pd.isna(training_set.loc[pd.Timestamp("2023-12-31"), "마지막방문_경과일"])
-    # As of 2024-02-14 (the day before V2), only V1 is knowable - 44 days
-    # elapsed since it, and V2 itself must not leak in.
-    assert training_set.loc[pd.Timestamp("2024-02-14"), "마지막방문_경과일"] == 44
+    # As of 2024-03-19 (the day before V3), V2 anchors - 33 days elapsed
+    # since it, and V3 itself must not leak in.
+    assert training_set.loc[pd.Timestamp("2024-03-19"), "마지막방문_경과일"] == 33
+    # As of 2024-04-19 (the day before V4), V3 anchors - 30 days elapsed.
+    assert training_set.loc[pd.Timestamp("2024-04-19"), "마지막방문_경과일"] == 30
 
 
 
@@ -147,7 +215,7 @@ def test_x_features_match_build_marts_snapshot_for_the_same_date():
 
 
 def test_x_features_have_lightgbm_ready_dtypes():
-    raw_visits = make_raw_visits(make_high_frequency_filler_visits() + _chronic_customer_history())
+    raw_visits = make_raw_visits(make_high_frequency_filler_visits(_FILLER_OCCURRENCES) + _chronic_customer_history())
 
     training_set = build_mart1_training_set(raw_visits)
 
@@ -208,7 +276,7 @@ def test_split_of_empty_training_set_returns_three_empty_frames():
 
 
 def test_split_columns_match_input_columns():
-    raw_visits = make_raw_visits(make_high_frequency_filler_visits() + _chronic_customer_history())
+    raw_visits = make_raw_visits(make_high_frequency_filler_visits(_FILLER_OCCURRENCES) + _chronic_customer_history())
     training_set = build_mart1_training_set(raw_visits)
 
     split = split_mart1_training_set(training_set)
