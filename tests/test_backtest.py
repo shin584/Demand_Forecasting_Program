@@ -9,10 +9,19 @@ from conftest import (
     make_visit_row,
 )
 from pipeline.backtest import (
+    ACTUAL_CHRONIC_VISITS_COL,
     ACTUAL_COL,
     BACKTEST_DAILY_COLUMNS,
+    BACKTEST_PER_DATE_COLUMNS,
     ERROR_COL,
     PREDICTED_COL,
+    SCORED_POPULATION_SIZE_COL,
+    SUM_VISIT_PROB_COL,
+    TRACK1_ACTUAL_COL,
+    TRACK1_PREDICTED_COL,
+    TRACK2_ACTUAL_COL,
+    TRACK2_PREDICTED_COL,
+    VISIT_LIST_SIZE_COL,
     run_backtest,
 )
 from pipeline.marts import (
@@ -233,3 +242,135 @@ def test_empty_test_dates_returns_nan_wape_and_empty_daily():
     assert np.isnan(result.summary.wape)
     assert result.summary.total_predicted == 0.0
     assert result.summary.total_actual == 0.0
+
+
+def _one_chronic_customer_on_drug_501() -> list[dict]:
+    """Customer 1: Chronic since an old Revisit Match (drug 901, 소모량 0.0
+    so it never adds predicted demand), whose most recent visit (2024-01-01)
+    dispenses rare drug 501 at 40.0 -- so Track 1 predicts 40.0 of drug 501
+    every day the model clears the cutoff (100%-allocation rule, see
+    docs/adr/0004), and Track 2 predicts nothing (the filler's noise drugs
+    are too rare for Mart 3)."""
+    return make_high_frequency_filler_visits() + [
+        make_visit_row(
+            조제판매ID=10,
+            고객ID=1,
+            내방일="2023-11-01",
+            다음내방일="2023-12-01",
+            약품ID=901,
+            소모량=0.0,
+        ),
+        make_visit_row(조제판매ID=11, 고객ID=1, 내방일="2023-11-15", 약품ID=901, 소모량=0.0),
+        make_visit_row(조제판매ID=12, 고객ID=1, 내방일="2024-01-01", 약품ID=501, 소모량=40.0),
+    ]
+
+
+def _per_track_fixture() -> pd.DataFrame:
+    # Target date 2024-01-15 (as-of 2024-01-14):
+    # - customer 1 (scored by Track 1) consumes 30.0 of drug 501
+    # - customer 3 (one-off, Track 2's population) consumes 10.0 of drug 501
+    # - customer 2 (one-off, Track 2's population) consumes 25.0 of drug 777
+    return make_raw_visits(
+        _one_chronic_customer_on_drug_501()
+        + [
+            make_visit_row(조제판매ID=100, 고객ID=1, 내방일="2024-01-15", 약품ID=501, 소모량=30.0),
+            make_visit_row(조제판매ID=101, 고객ID=3, 내방일="2024-01-15", 약품ID=501, 소모량=10.0),
+            make_visit_row(조제판매ID=102, 고객ID=2, 내방일="2024-01-15", 약품ID=777, 소모량=25.0),
+        ]
+    )
+
+
+def test_daily_splits_predicted_and_actual_per_track():
+    result = run_backtest(_per_track_fixture(), StubModel(0.5), test_dates=["2024-01-14"])
+
+    daily = result.daily.set_index(DRUG_ID_COL)
+    assert daily.loc[501, TRACK1_PREDICTED_COL] == pytest.approx(40.0)
+    assert daily.loc[501, TRACK2_PREDICTED_COL] == 0.0
+    assert daily.loc[501, TRACK1_ACTUAL_COL] == pytest.approx(30.0)
+    assert daily.loc[501, TRACK2_ACTUAL_COL] == pytest.approx(10.0)
+    assert daily.loc[777, TRACK1_ACTUAL_COL] == 0.0
+    assert daily.loc[777, TRACK2_ACTUAL_COL] == pytest.approx(25.0)
+
+
+def test_per_track_columns_sum_to_the_combined_columns():
+    result = run_backtest(_per_track_fixture(), StubModel(0.5), test_dates=["2024-01-14"])
+
+    daily = result.daily
+    pd.testing.assert_series_equal(
+        daily[TRACK1_PREDICTED_COL] + daily[TRACK2_PREDICTED_COL],
+        daily[PREDICTED_COL],
+        check_names=False,
+    )
+    pd.testing.assert_series_equal(
+        daily[TRACK1_ACTUAL_COL] + daily[TRACK2_ACTUAL_COL],
+        daily[ACTUAL_COL],
+        check_names=False,
+    )
+
+
+def test_per_track_wape_matches_hand_computed_values():
+    result = run_backtest(_per_track_fixture(), StubModel(0.5), test_dates=["2024-01-14"])
+
+    # Track 1: |40 - 30| / 30.  Track 2: (|0 - 10| + |0 - 25|) / 35.
+    assert result.summary.track1_wape == pytest.approx(10.0 / 30.0)
+    assert result.summary.track2_wape == pytest.approx(1.0)
+    # Combined (unchanged formula): drug 501 |40 - 40| + drug 777 |0 - 25|, over 65.
+    assert result.summary.wape == pytest.approx(25.0 / 65.0)
+
+
+def test_per_date_reports_visit_probability_sum_against_actual_chronic_visits():
+    # Two scored Chronic customers (1 and 4); only customer 1 visits on the
+    # target date, on two drug rows -- one visit, not two. Customer 2's
+    # one-off visit isn't a Chronic visit at all.
+    raw_visits = make_raw_visits(
+        _one_chronic_customer_on_drug_501()
+        + make_independent_chronic_match_visits(customer_id=4, drug_id=902, visit_id_start=20)
+        + [
+            make_visit_row(조제판매ID=100, 고객ID=1, 내방일="2024-01-15", 약품ID=501, 소모량=30.0),
+            make_visit_row(조제판매ID=100, 고객ID=1, 내방일="2024-01-15", 약품ID=502, 소모량=5.0),
+            make_visit_row(조제판매ID=101, 고객ID=2, 내방일="2024-01-15", 약품ID=777, 소모량=25.0),
+        ]
+    )
+
+    result = run_backtest(raw_visits, StubModel(0.5), test_dates=["2024-01-14"])
+
+    assert list(result.per_date.columns) == BACKTEST_PER_DATE_COLUMNS
+    row = result.per_date.set_index(SNAPSHOT_DATE_COL).loc[pd.Timestamp("2024-01-14")]
+    assert row[SUM_VISIT_PROB_COL] == pytest.approx(1.0)
+    assert row[ACTUAL_CHRONIC_VISITS_COL] == 1
+    assert row[VISIT_LIST_SIZE_COL] == 2
+    assert row[SCORED_POPULATION_SIZE_COL] == 2
+
+
+def test_per_date_visit_list_size_respects_the_cutoff():
+    raw_visits = make_raw_visits(_one_chronic_customer_on_drug_501())
+
+    result = run_backtest(raw_visits, StubModel(0.2), test_dates=["2024-01-14"])
+
+    row = result.per_date.iloc[0]
+    assert row[VISIT_LIST_SIZE_COL] == 0
+    assert row[SCORED_POPULATION_SIZE_COL] == 1
+    assert row[SUM_VISIT_PROB_COL] == pytest.approx(0.2)
+    assert row[ACTUAL_CHRONIC_VISITS_COL] == 0
+
+
+def test_per_date_has_one_row_per_test_date():
+    raw_visits = make_raw_visits(_one_chronic_customer_on_drug_501())
+
+    result = run_backtest(raw_visits, StubModel(0.5), test_dates=["2024-01-14", "2024-01-15"])
+
+    assert list(result.per_date[SNAPSHOT_DATE_COL]) == [
+        pd.Timestamp("2024-01-14"),
+        pd.Timestamp("2024-01-15"),
+    ]
+
+
+def test_empty_test_dates_returns_empty_per_date_and_nan_track_wapes():
+    raw_visits = make_raw_visits(_one_chronic_customer_on_drug_501())
+
+    result = run_backtest(raw_visits, StubModel(0.5), test_dates=[])
+
+    assert result.per_date.empty
+    assert list(result.per_date.columns) == BACKTEST_PER_DATE_COLUMNS
+    assert np.isnan(result.summary.track1_wape)
+    assert np.isnan(result.summary.track2_wape)

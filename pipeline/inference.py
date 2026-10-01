@@ -42,6 +42,9 @@ from .model import CHRONIC_VISIT_PROB_CUTOFF, prepare_track1_features
 VISIT_PROB_COL = "예측방문확률"
 TRACK1_DEMAND_COL = "track1_기댓값"
 VISIT_LIST_COLUMNS = [SNAPSHOT_DATE_COL, CUSTOMER_ID_COL, VISIT_PROB_COL]
+# Every scored customer, not only those meeting the cutoff -- the Visit List
+# is this frame filtered by `chronic_visit_prob_cutoff` (see issue #25).
+SCORED_POPULATION_COLUMNS = VISIT_LIST_COLUMNS
 TRACK1_DEMAND_COLUMNS = [SNAPSHOT_DATE_COL, DRUG_ID_COL, TRACK1_DEMAND_COL]
 
 # The combined order-quantity table's own columns (see CONTEXT.md "Safety
@@ -67,11 +70,13 @@ SAFETY_STOCK_BUFFER = 1.2
 class Track1Result(NamedTuple):
     visit_list: pd.DataFrame
     drug_demand: pd.DataFrame
+    scored_population: pd.DataFrame
 
 
 class ForecastResult(NamedTuple):
     order_quantities: pd.DataFrame
     visit_list: pd.DataFrame
+    scored_population: pd.DataFrame
 
 
 def run_track1_inference(
@@ -94,7 +99,9 @@ def run_track1_inference(
     Every customer in the snapshot is scored -- no pre-filtering beyond Mart
     1's own Chronic population (see `build_marts`). The Visit List
     (`VISIT_LIST_COLUMNS`: 기준일자, 고객ID, 예측방문확률) contains exactly the
-    customers whose predicted probability is `>= chronic_visit_prob_cutoff`.
+    customers whose predicted probability is `>= chronic_visit_prob_cutoff`;
+    `scored_population` (`SCORED_POPULATION_COLUMNS`) is every scored
+    customer with their probability, cutoff or not.
 
     `drug_demand` (`TRACK1_DEMAND_COLUMNS`: 기준일자, 약품ID, track1_기댓값) is
     the ordinary expected-value formula -- probability x Mart 2 latest
@@ -138,9 +145,10 @@ def _track1_from_marts(
     instead of building the same snapshot twice."""
     probabilities = _score_mart1(mart1, model)
 
-    visit_list = _build_visit_list(
-        mart1[CUSTOMER_ID_COL], probabilities, as_of_date, chronic_visit_prob_cutoff
+    scored_population = _build_scored_population(
+        mart1[CUSTOMER_ID_COL], probabilities, as_of_date
     )
+    visit_list = _build_visit_list(scored_population, chronic_visit_prob_cutoff)
     drug_demand = _track1_drug_demand(
         mart1[CUSTOMER_ID_COL],
         probabilities,
@@ -150,7 +158,9 @@ def _track1_from_marts(
         chronic_visit_prob_cutoff,
         rare_drug_patient_threshold,
     )
-    return Track1Result(visit_list=visit_list, drug_demand=drug_demand)
+    return Track1Result(
+        visit_list=visit_list, drug_demand=drug_demand, scored_population=scored_population
+    )
 
 
 def _score_mart1(mart1: pd.DataFrame, model) -> pd.Series:
@@ -160,20 +170,27 @@ def _score_mart1(mart1: pd.DataFrame, model) -> pd.Series:
     return pd.Series(model.predict_proba(features)[:, 1], index=mart1.index)
 
 
-def _build_visit_list(
+def _build_scored_population(
     customer_ids: pd.Series,
     probabilities: pd.Series,
     as_of_date: pd.Timestamp,
-    chronic_visit_prob_cutoff: float,
 ) -> pd.DataFrame:
-    visit_list = pd.DataFrame(
+    scored_population = pd.DataFrame(
         {
             SNAPSHOT_DATE_COL: as_of_date,
             CUSTOMER_ID_COL: customer_ids,
             VISIT_PROB_COL: probabilities,
         }
     )
-    visit_list = visit_list[visit_list[VISIT_PROB_COL] >= chronic_visit_prob_cutoff]
+    return scored_population.reset_index(drop=True)[SCORED_POPULATION_COLUMNS]
+
+
+def _build_visit_list(
+    scored_population: pd.DataFrame, chronic_visit_prob_cutoff: float
+) -> pd.DataFrame:
+    visit_list = scored_population[
+        scored_population[VISIT_PROB_COL] >= chronic_visit_prob_cutoff
+    ]
     return visit_list.reset_index(drop=True)[VISIT_LIST_COLUMNS]
 
 
@@ -260,7 +277,8 @@ def run_daily_forecast(
     track1_기댓값, track2_통계값, 최종발주량) is the union of every drug
     appearing in Track 1's or Track 2's result, zero-filled on whichever side
     is absent, with 최종발주량 = (track1_기댓값 + track2_통계값) x
-    `safety_stock_buffer` (see CONTEXT.md "Safety Stock").
+    `safety_stock_buffer` (see CONTEXT.md "Safety Stock"). `visit_list` and
+    `scored_population` are passed through from Track 1 unchanged.
     """
     as_of_date = pd.Timestamp(as_of_date)
     # One snapshot serves both tracks: the Mart 3 thresholds passed here
@@ -285,7 +303,11 @@ def run_daily_forecast(
     order_quantities = _combine_order_quantities(
         track1.drug_demand, mart3, raw_visits, as_of_date, safety_stock_buffer
     )
-    return ForecastResult(order_quantities=order_quantities, visit_list=track1.visit_list)
+    return ForecastResult(
+        order_quantities=order_quantities,
+        visit_list=track1.visit_list,
+        scored_population=track1.scored_population,
+    )
 
 
 def _combine_order_quantities(

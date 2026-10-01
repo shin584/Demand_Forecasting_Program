@@ -12,6 +12,7 @@ from pipeline.inference import (
     FINAL_ORDER_COL,
     ORDER_QUANTITY_COLUMNS,
     SAFETY_STOCK_BUFFER,
+    SCORED_POPULATION_COLUMNS,
     TRACK1_DEMAND_COL,
     TRACK1_DEMAND_COLUMNS,
     TRACK2_STAT_COL,
@@ -20,7 +21,12 @@ from pipeline.inference import (
     run_daily_forecast,
     run_track1_inference,
 )
-from pipeline.marts import CUSTOMER_ID_COL, DRUG_ID_COL, DRUG_NAME_COL, SNAPSHOT_DATE_COL
+from pipeline.marts import (
+    CUSTOMER_ID_COL,
+    DRUG_ID_COL,
+    DRUG_NAME_COL,
+    SNAPSHOT_DATE_COL,
+)
 
 
 class StubModel:
@@ -110,6 +116,33 @@ def test_scores_every_chronic_customer_with_no_prefiltering():
 
     # Both Chronic customers got scored and appear once cutoff admits everyone.
     assert sorted(result.visit_list[CUSTOMER_ID_COL]) == [1, 2]
+
+
+def test_scored_population_lists_every_scored_customer_regardless_of_cutoff():
+    raw_visits = _two_chronic_customers_with_drug_consumption(
+        "2024-01-01", drug_id=501, consumption_1=40.0, consumption_2=20.0
+    )
+    model = StubModel([0.2, 0.5])
+
+    result = run_track1_inference(
+        raw_visits, as_of_date="2024-01-01", model=model, chronic_visit_prob_cutoff=0.3
+    )
+
+    scored = result.scored_population
+    assert list(scored.columns) == SCORED_POPULATION_COLUMNS
+    assert scored.set_index(CUSTOMER_ID_COL)[VISIT_PROB_COL].to_dict() == {1: 0.2, 2: 0.5}
+    assert (scored[SNAPSHOT_DATE_COL] == pd.Timestamp("2024-01-01")).all()
+
+
+def test_daily_forecast_passes_scored_population_through_unchanged():
+    raw_visits = _two_chronic_customers_with_drug_consumption(
+        "2024-01-01", drug_id=501, consumption_1=40.0, consumption_2=20.0
+    )
+
+    track1 = run_track1_inference(raw_visits, as_of_date="2024-01-01", model=StubModel([0.2, 0.8]))
+    result = run_daily_forecast(raw_visits, as_of_date="2024-01-01", model=StubModel([0.2, 0.8]))
+
+    pd.testing.assert_frame_equal(result.scored_population, track1.scored_population)
 
 
 def test_visit_list_contains_exactly_customers_at_or_above_cutoff():

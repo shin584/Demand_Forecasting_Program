@@ -27,6 +27,10 @@ from pipeline.backtest import (
     ACTUAL_COL,
     ERROR_COL,
     PREDICTED_COL,
+    TRACK1_ACTUAL_COL,
+    TRACK1_PREDICTED_COL,
+    TRACK2_ACTUAL_COL,
+    TRACK2_PREDICTED_COL,
     run_backtest,
 )
 from pipeline.marts import (
@@ -56,7 +60,7 @@ def _load_raw_visits(path: Path) -> pd.DataFrame:
 
 
 def _wape_breakdown(daily: pd.DataFrame, group_col: str) -> pd.DataFrame:
-    """Same WAPE formula as `pipeline.backtest._summarize`
+    """Same WAPE formula as `pipeline.backtest._wape`
     (`sum(abs error) / sum(actual)`), grouped by `group_col` instead of taken
     once over the whole window -- see issue #18's Implementation Decisions
     ("WAPE formula ... computed both per as-of-date and once overall")."""
@@ -65,18 +69,42 @@ def _wape_breakdown(daily: pd.DataFrame, group_col: str) -> pd.DataFrame:
     return breakdown
 
 
+def _track_totals(daily: pd.DataFrame, predicted_col: str, actual_col: str) -> str:
+    return f"predicted {daily[predicted_col].sum():.2f}, actual {daily[actual_col].sum():.2f}"
+
+
+def _visit_probability_table(per_date: pd.DataFrame) -> pd.DataFrame:
+    """`result.per_date` indexed by as-of-date, with a "Total" row summing
+    every column over the window (see issue #25)."""
+    table = per_date.set_index(SNAPSHOT_DATE_COL)
+    table.index = table.index.strftime("%Y-%m-%d")
+    dtypes = table.dtypes
+    table.loc["Total"] = table.sum()
+    return table.astype(dtypes)
+
+
 def _write_report(path: Path, result) -> None:
-    per_date = _wape_breakdown(result.daily, SNAPSHOT_DATE_COL)
+    summary = result.summary
+    wape_by_date = _wape_breakdown(result.daily, SNAPSHOT_DATE_COL)
     per_drug = _wape_breakdown(result.daily, DRUG_ID_COL).sort_values(ERROR_COL, ascending=False)
 
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
-        f.write(f"WAPE: {result.summary.wape:.4f}\n")
-        f.write(f"Total predicted: {result.summary.total_predicted:.2f}\n")
-        f.write(f"Total actual: {result.summary.total_actual:.2f}\n")
-        f.write(f"Days: {len(per_date)}\n\n")
-        f.write("Per-as-of-date WAPE:\n")
-        f.write(per_date.to_string())
+        f.write(f"WAPE: {summary.wape:.4f}\n")
+        f.write(f"  Track 1 WAPE: {summary.track1_wape:.4f} ")
+        f.write(f"({_track_totals(result.daily, TRACK1_PREDICTED_COL, TRACK1_ACTUAL_COL)})\n")
+        f.write(f"  Track 2 WAPE: {summary.track2_wape:.4f} ")
+        f.write(f"({_track_totals(result.daily, TRACK2_PREDICTED_COL, TRACK2_ACTUAL_COL)})\n")
+        f.write(f"Total predicted: {summary.total_predicted:.2f}\n")
+        f.write(f"Total actual: {summary.total_actual:.2f}\n")
+        f.write(f"Days: {len(result.per_date)}\n\n")
+        f.write(
+            "Track 1 visit probabilities per as-of-date (Σp vs actual Chronic next-day "
+            "visits; Visit List size vs scored Chronic population):\n"
+        )
+        f.write(_visit_probability_table(result.per_date).to_string())
+        f.write("\n\nPer-as-of-date WAPE:\n")
+        f.write(wape_by_date.to_string())
         f.write("\n\nPer-drug breakdown (sorted by absolute error, descending):\n")
         f.write(per_drug.to_string())
         f.write("\n")
@@ -108,7 +136,10 @@ def main() -> None:
     result = run_backtest(raw_visits, trained.model, test_dates=test_dates)
     _write_report(REPORT_PATH, result)
 
-    print(f"WAPE: {result.summary.wape:.4f}")
+    print(
+        f"WAPE: {result.summary.wape:.4f} (Track 1 {result.summary.track1_wape:.4f}, "
+        f"Track 2 {result.summary.track2_wape:.4f})"
+    )
     print(f"Report written to {REPORT_PATH}")
 
 
