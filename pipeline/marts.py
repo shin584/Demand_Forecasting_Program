@@ -212,20 +212,30 @@ BASELINE_WEIGHT = 1.0
 # Mart 1's Y=0 negative-sampling scheme (see CONTEXT.md "Negative Sampling
 # Windows" and docs/Research-Log.md's absolute-day 초기(1~5일차)/중기(15일차)/
 # 말기(27~29일차) scheme this generalizes into proportions of each patient's
-# own 처방조제일수 cycle length): ~15% early, ~50% mid, ~90-96% late (up to 3
-# samples), then post-cycle multiples so the model sees overdue customers who
-# don't come back (see ADR-0005 "Post-cycle negatives"), plus one sample the
-# day before the Lapse Horizon. The ~1:5 positive:negative ratio the
-# in-cycle fractions once produced is no longer a target.
+# own 처방조제일수 cycle length): sample points at ~15% early, ~50% mid,
+# ~90-96% late, then post-cycle multiples so the model sees overdue customers
+# who don't come back (see ADR-0005 "Post-cycle negatives"), plus one the day
+# before the Lapse Horizon. The points only shape the windows each negative is
+# jittered within (see negative_sample_windows and issue #35). The ~1:5
+# positive:negative ratio the in-cycle fractions once produced is no longer a
+# target.
 NEGATIVE_SAMPLE_FRACTIONS = (0.15, 0.50, 0.90, 0.93, 0.96)
 POST_CYCLE_NEGATIVE_SAMPLE_MULTIPLES = (1.25, 1.5, 2.0, 3.0, 4.0)
+# Default seed for sample_mart1_negatives' jittered draws, so the same
+# raw_visits always gives the same Mart 1 Training Set.
+NEGATIVE_SAMPLE_SEED = 0
 
-MART1_NEGATIVE_SAMPLE_COLUMNS = [
+# A negative's sampling-window width in days (see negative_sample_windows),
+# which build_mart1_training_set folds into the row's 학습_가중치.
+WINDOW_WIDTH_COL = "샘플링_윈도우_폭"
+
+MART1_POSITIVE_SAMPLE_COLUMNS = [
     CUSTOMER_ID_COL,
     VISIT_ID_COL,
     SNAPSHOT_DATE_COL,
     NEXT_DAY_VISIT_COL,
 ]
+MART1_NEGATIVE_SAMPLE_COLUMNS = [*MART1_POSITIVE_SAMPLE_COLUMNS, WINDOW_WIDTH_COL]
 
 # build_mart1_training_set's output columns: MART1_COLUMNS (the same X/Y/weight
 # shape build_marts's single-snapshot mart1 uses) plus 기준일자, since a
@@ -333,7 +343,11 @@ def build_mart1_training_set(
     label (a visit on 기준일자 + 1) falls outside the data.
     학습_가중치 tiers are still derived once from the full, unfiltered
     `raw_visits`: the weight only scales a row's loss and is never a model
-    input, so it can't leak into predictions. The point, anchoring,
+    input, so it can't leak into predictions. Each negative's weight is
+    further scaled by its sampling window's width, normalised to mean 1
+    over the negatives kept here, so every in-bounds day counts the same in
+    expectation (see `sample_mart1_negatives`); positives keep their tier
+    weight. The point, anchoring,
     family-total, and MPR/no-show X-features are computed as of each row's
     own snapshot date, by the same `_mart1_x_features` `build_marts` uses, in
     one vectorized pass over every row rather than once per distinct
@@ -373,6 +387,11 @@ def build_mart1_training_set(
     # here is already restricted to chronic_customer_ids.
     result[CHRONIC_COL] = True
     result = _attach_mart1_weight(result, raw_visits, chronic_customer_ids)
+    # Each negative stands for its whole sampling window, so it's weighted by
+    # the window's width, normalised to mean 1 over the negatives that made
+    # it this far; positives (no window) keep their tier weight.
+    window_widths = result[WINDOW_WIDTH_COL].astype(float)
+    result[WEIGHT_COL] *= (window_widths / window_widths.mean()).fillna(1.0)
     return result[MART1_TRAINING_COLUMNS]
 
 
@@ -684,61 +703,79 @@ def _eligibility_flag_mask(column: pd.Series) -> pd.Series:
     return column.astype("string").str.strip().str.upper().eq("Y").fillna(False)
 
 
-def negative_sample_offsets(
+def negative_sample_windows(
     prescription_days: float, lapse_horizon_days: int = LAPSE_HORIZON_DAYS
-) -> list[int]:
-    """Day-offsets (relative to an anchoring visit) for Mart 1's Y=0
-    negative-sampling scheme (see CONTEXT.md "Negative Sampling Windows").
+) -> list[tuple[int, int]]:
+    """Day-offset windows (relative to an anchoring visit) for Mart 1's Y=0
+    negative sampling (see CONTEXT.md "Negative Sampling Windows" and
+    issue #35), each a half-open [lo, hi) that one negative is drawn from.
 
-    Offsets are proportions of `prescription_days` - that visit's own
-    처방조제일수 cycle length - rather than fixed absolute days, so sampling
-    stays meaningful whether the observed cycle is 7 days or 60+: in-cycle
-    at 15/50/90/93/96%, post-cycle at 1.25/1.5/2/3/4x, plus one sample the
-    day before the Lapse Horizon. Every offset is >=1 day so no negative
-    sample can land on or before the anchoring visit itself, and none lies
-    beyond `lapse_horizon_days`, where the customer is Lapsed and never
-    scored; offsets a short cycle rounds onto the same day are collapsed.
+    The windows are built around sample points that are proportions of
+    `prescription_days` - that visit's own 처방조제일수 cycle length -
+    rather than fixed absolute days, so sampling stays meaningful whether
+    the observed cycle is 7 days or 60+: in-cycle at 15/50/90/93/96%,
+    post-cycle at 1.25/1.5/2/3/4x, plus the day before the Lapse Horizon.
+    Points past `lapse_horizon_days`, where the customer is Lapsed and
+    never scored, are left out; a missing `prescription_days` leaves only
+    the day-before-horizon point. Each window runs between the midpoints
+    with its neighbouring points, rounded to whole days; the first starts
+    on day 1 and the last ends on the horizon's own day, so together they
+    tile days 1..lapse_horizon_days with no gap or overlap. Windows that
+    round to nothing are dropped, which is how a short cycle's crowded
+    points collapse.
     """
-    offsets = {
-        max(1, round(prescription_days * fraction))
-        for fraction in NEGATIVE_SAMPLE_FRACTIONS + POST_CYCLE_NEGATIVE_SAMPLE_MULTIPLES
-    }
-    offsets.add(lapse_horizon_days - 1)
-    return sorted(offset for offset in offsets if offset <= lapse_horizon_days)
-
-
-def negative_sample_dates(
-    visit_date, prescription_days: float, lapse_horizon_days: int = LAPSE_HORIZON_DAYS
-) -> list[pd.Timestamp]:
-    """Candidate Mart 1 Y=0 snapshot dates for one anchoring visit, via the
-    in-cycle/post-cycle scheme (see negative_sample_offsets)."""
-    visit_date = pd.Timestamp(visit_date)
-    return [
-        visit_date + pd.Timedelta(days=offset)
-        for offset in negative_sample_offsets(prescription_days, lapse_horizon_days)
+    points = [lapse_horizon_days - 1]
+    if not np.isnan(prescription_days):
+        points += [
+            prescription_days * multiple
+            for multiple in NEGATIVE_SAMPLE_FRACTIONS + POST_CYCLE_NEGATIVE_SAMPLE_MULTIPLES
+            if prescription_days * multiple <= lapse_horizon_days
+        ]
+    points.sort()
+    day_after_horizon = lapse_horizon_days + 1
+    edges = [
+        1,
+        *(
+            min(max(round((a + b) / 2), 1), day_after_horizon)
+            for a, b in zip(points, points[1:])
+        ),
+        day_after_horizon,
     ]
+    return [(lo, hi) for lo, hi in zip(edges, edges[1:]) if lo < hi]
 
 
 def sample_mart1_negatives(
     raw_visits: pd.DataFrame,
     chronic_customer_ids: set | None = None,
     lapse_horizon_days: int = LAPSE_HORIZON_DAYS,
+    seed: int = NEGATIVE_SAMPLE_SEED,
 ) -> pd.DataFrame:
-    """Mart 1's Y=0 negative-sample rows, via the in-cycle/post-cycle
-    scheme (see negative_sample_offsets), anchored on every visit by a
-    Chronic Patient (see ADR-0001) - including each customer's last known
-    visit, so the model sees customers who are overdue and don't come back.
+    """Mart 1's Y=0 negative-sample rows: one per (anchoring visit,
+    `negative_sample_windows` window), on a uniformly random day of that
+    window, anchored on every visit by a Chronic Patient (see ADR-0001) -
+    including each customer's last known visit, so the model sees customers
+    who are overdue and don't come back. Jittering within windows, rather
+    than sampling on the points themselves, keeps the model from telling a
+    negative apart by where 마지막방문_경과일 lands on a fixed grid (issue
+    #35). Draws come from a `seed`ed RNG, so the same input always gives the
+    same rows.
 
-    One row per (anchoring visit, sampled offset), dated that visit's own
-    내방일 plus the offset, kept only if it's at least two days before the
-    anchoring visit's next visit (the customer's earliest visit on a later
-    date): a sample on the day before it would actually be a Next-Day Visit
-    positive, and one on or after it describes a cycle that's already over.
-    It must also be dated before the extract's last 내방일, so "no visit on
-    기준일자 + 1" is still observed -- the only bound on samples anchored by
-    a customer's last visit, besides the Lapse Horizon the offsets already
-    stop at. Those bounds are what make the Y=0 label true, not just
-    assumed.
+    A drawn row is dated that visit's own 내방일 plus the drawn day, and kept
+    only if it's at least two days before the anchoring visit's next visit
+    (the customer's earliest visit on a later date): a sample on the day
+    before it would actually be a Next-Day Visit positive, and one on or
+    after it describes a cycle that's already over. It must also be dated
+    before the extract's last 내방일, so "no visit on 기준일자 + 1" is still
+    observed -- the only bound on samples anchored by a customer's last
+    visit, besides the Lapse Horizon the windows already stop at. Those
+    bounds are what make the Y=0 label true, not just assumed. They're
+    applied after the draw, never by shrinking a window first, so each
+    window's expected contribution is the number of its days inside the
+    bounds.
+
+    Each row carries its window's width (`WINDOW_WIDTH_COL`), which
+    `build_mart1_training_set` folds into 학습_가중치 so every in-bounds day
+    counts the same in expectation, as under daily sampling.
     `chronic_customer_ids` can be passed in to reuse a result already
     computed by `build_marts`; otherwise it's derived here via
     `revisit_match`.
@@ -776,35 +813,30 @@ def sample_mart1_negatives(
     )
     anchors = visits.merge(visit_days, on=[CUSTOMER_ID_COL, VISIT_DATE_COL], how="left")
 
-    # negative_sample_offsets, vectorized: np.rint rounds half-to-even exactly
-    # like the built-in round() it uses. Offsets past the horizon are masked
-    # to NaN and dropped once stacked.
-    offsets = np.maximum(
-        1,
-        np.rint(
-            np.outer(
-                anchors[PRESCRIPTION_DAYS_COL].to_numpy(dtype=float),
-                NEGATIVE_SAMPLE_FRACTIONS + POST_CYCLE_NEGATIVE_SAMPLE_MULTIPLES,
-            )
-        ),
+    # Windows are computed once per distinct 처방조제일수 (a missing one
+    # included), then joined onto every anchor with that value. Rows stay in
+    # anchor-then-window order, so a seed always maps to the same draws.
+    cycle_codes, cycle_lengths = pd.factorize(
+        anchors[PRESCRIPTION_DAYS_COL].astype(float), use_na_sentinel=False
     )
-    offsets = np.column_stack([offsets, np.full(len(anchors), lapse_horizon_days - 1)])
-    offsets = np.where(offsets <= lapse_horizon_days, offsets, np.nan)
+    windows = pd.DataFrame(
+        [
+            (code, lo, hi)
+            for code, cycle_length in enumerate(cycle_lengths)
+            for lo, hi in negative_sample_windows(cycle_length, lapse_horizon_days)
+        ],
+        columns=["_cycle_code", "_lo", "_hi"],
+    )
     samples = (
-        pd.DataFrame(offsets)
-        .stack()
-        .dropna()
-        .rename("_offset")
-        .reset_index(level=1, drop=True)
-        .rename_axis("_anchor")
-        .reset_index()
-        .drop_duplicates()
-        .sort_values(["_anchor", "_offset"], kind="stable")
+        pd.DataFrame({"_anchor": np.arange(len(anchors)), "_cycle_code": cycle_codes})
+        .merge(windows, on="_cycle_code")
+        .sort_values(["_anchor", "_lo"], kind="stable")
+        .reset_index(drop=True)
     )
-    anchor_rows = anchors.loc[samples["_anchor"]].reset_index(drop=True)
-    snapshot_dates = anchor_rows[VISIT_DATE_COL] + pd.to_timedelta(
-        samples["_offset"].to_numpy(), unit="D"
-    )
+    offsets = np.random.default_rng(seed).integers(samples["_lo"], samples["_hi"])
+
+    anchor_rows = anchors.iloc[samples["_anchor"]].reset_index(drop=True)
+    snapshot_dates = anchor_rows[VISIT_DATE_COL] + pd.to_timedelta(offsets, unit="D")
     # A visit on the customer's last date has no next visit, so the
     # extract's end alone bounds its samples.
     next_visit_dates = anchor_rows["_next_visit_date"]
@@ -818,6 +850,7 @@ def sample_mart1_negatives(
             VISIT_ID_COL: anchor_rows[VISIT_ID_COL],
             SNAPSHOT_DATE_COL: snapshot_dates,
             NEXT_DAY_VISIT_COL: False,
+            WINDOW_WIDTH_COL: samples["_hi"] - samples["_lo"],
         },
         columns=MART1_NEGATIVE_SAMPLE_COLUMNS,
     )[is_true_negative].reset_index(drop=True)
@@ -835,8 +868,9 @@ def _mart1_positive_samples(raw_visits: pd.DataFrame, chronic_customer_ids: set)
 
     Paired with `sample_mart1_negatives`'s Y=0 rows by
     `build_mart1_training_set` to assemble Mart 1's full historical training
-    set. Same output shape (`MART1_NEGATIVE_SAMPLE_COLUMNS`) as
-    `sample_mart1_negatives` so the two concatenate directly.
+    set. Same columns as `sample_mart1_negatives` minus its window width
+    (`MART1_POSITIVE_SAMPLE_COLUMNS`), so the two concatenate directly and a
+    positive's width is left missing.
     """
     visits = _one_row_per_visit(raw_visits, [CUSTOMER_ID_COL, VISIT_DATE_COL])
     visits = visits[visits[CUSTOMER_ID_COL].isin(chronic_customer_ids)]
@@ -848,7 +882,7 @@ def _mart1_positive_samples(raw_visits: pd.DataFrame, chronic_customer_ids: set)
             SNAPSHOT_DATE_COL: (visit_dates - pd.Timedelta(days=1)).to_numpy(),
             NEXT_DAY_VISIT_COL: True,
         },
-        columns=MART1_NEGATIVE_SAMPLE_COLUMNS,
+        columns=MART1_POSITIVE_SAMPLE_COLUMNS,
     )
 
 

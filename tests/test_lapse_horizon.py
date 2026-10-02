@@ -7,6 +7,7 @@ from pipeline.marts import (
     SNAPSHOT_DATE_COL,
     build_mart1_training_set,
     build_marts,
+    negative_sample_windows,
 )
 
 # Customer 1's last visit: the later visit of their only Revisit-Matched
@@ -108,10 +109,10 @@ def test_training_set_drops_a_positive_whose_customer_is_lapsed_as_of_it(gap_day
 
 def test_training_set_drops_negatives_past_the_lapse_horizon():
     # A 300-day cycle anchored on the visit that makes customer 1 Chronic:
-    # its early/mid negatives (+45, +150 days) and the day-before-horizon
-    # one (+179) are within the horizon, its late and post-cycle ones
-    # (+270 and later) are not. The first visit's own negatives all predate
-    # the Chronic-since Date.
+    # only its +45 and +150 day points and the day-before-horizon one (+179)
+    # lie within the horizon, so it gets exactly three windows, and none of
+    # their draws is past day 180. The first visit's own negatives all
+    # predate the Chronic-since Date.
     raw_visits = make_raw_visits(
         make_high_frequency_filler_visits(_FILLER_OCCURRENCES)
         + _chronic_customer(last_visit_prescription_days=300)
@@ -121,8 +122,6 @@ def test_training_set_drops_negatives_past_the_lapse_horizon():
     training_set = build_mart1_training_set(raw_visits)
 
     negatives = training_set[training_set["내일_방문"] == False]  # noqa: E712
-    assert sorted(negatives[SNAPSHOT_DATE_COL]) == [
-        _LAST_VISIT + pd.Timedelta(days=45),
-        _LAST_VISIT + pd.Timedelta(days=150),
-        _LAST_VISIT + pd.Timedelta(days=179),
-    ]
+    days_after = sorted((negatives[SNAPSHOT_DATE_COL] - _LAST_VISIT).dt.days)
+    assert len(days_after) == len(negative_sample_windows(300)) == 3
+    assert 1 <= days_after[0] and days_after[-1] <= LAPSE_HORIZON_DAYS

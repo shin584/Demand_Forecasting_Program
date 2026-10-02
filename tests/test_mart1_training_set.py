@@ -1,4 +1,5 @@
 import pandas as pd
+import pytest
 
 from conftest import (
     make_high_frequency_filler_visits,
@@ -14,6 +15,7 @@ from pipeline.marts import (
     LAPSE_HORIZON_DAYS,
     MART1_TRAINING_COLUMNS,
     SNAPSHOT_DATE_COL,
+    WINDOW_WIDTH_COL,
     build_mart1_training_set,
     build_marts,
     sample_mart1_negatives,
@@ -172,8 +174,49 @@ def test_weight_uses_the_full_raw_visits_not_as_of_filtered():
 
     training_set = build_mart1_training_set(raw_visits)
 
-    assert not training_set.empty
-    assert (training_set["학습_가중치"] == 3.0).all()
+    positives = training_set[training_set["내일_방문"] == True]  # noqa: E712
+    negatives = training_set[training_set["내일_방문"] == False]  # noqa: E712
+    assert not positives.empty
+    assert (positives["학습_가중치"] == 3.0).all()
+    # Negatives scale the same tier by their mean-1 window weight.
+    assert negatives["학습_가중치"].mean() == pytest.approx(3.0)
+
+
+def test_negative_weights_are_proportional_to_window_width_with_mean_1():
+    # Customer 2 is a second Chronic customer with a different cycle length,
+    # so the mean is taken across every negative, not per customer.
+    raw_visits = make_raw_visits(
+        make_high_frequency_filler_visits(_FILLER_OCCURRENCES)
+        + _chronic_customer_history()
+        + [
+            make_visit_row(
+                조제판매ID=20, 고객ID=2, 가족ID=2, 내방일="2024-01-05",
+                다음내방일="2024-02-04", 처방조제일수=7, 약품ID=5,
+            ),
+            make_visit_row(
+                조제판매ID=21, 고객ID=2, 가족ID=2, 내방일="2024-02-01",
+                처방조제일수=7, 약품ID=5,
+            ),
+        ]
+    )
+    sampled = sample_mart1_negatives(raw_visits)
+
+    training_set = build_mart1_training_set(raw_visits)
+
+    negatives = training_set[training_set["내일_방문"] == False]  # noqa: E712
+    widths = negatives.merge(
+        sampled[["고객ID", SNAPSHOT_DATE_COL, WINDOW_WIDTH_COL]],
+        on=["고객ID", SNAPSHOT_DATE_COL],
+        validate="one_to_one",
+    )
+    assert set(widths["고객ID"]) == {1, 2}
+    assert len(widths) == len(negatives)
+    expected_scale = widths[WINDOW_WIDTH_COL] / widths[WINDOW_WIDTH_COL].mean()
+    # Both customers sit in the same chronic tier (2.0), which positives keep.
+    assert (training_set.loc[training_set["내일_방문"] == True, "학습_가중치"] == 2.0).all()  # noqa: E712
+    assert list(widths["학습_가중치"]) == pytest.approx(list(2.0 * expected_scale))
+    assert (widths["학습_가중치"] / 2.0).mean() == pytest.approx(1.0)
+    assert widths[WINDOW_WIDTH_COL].nunique() > 1
 
 
 def test_x_features_are_computed_as_of_each_rows_own_snapshot_date():
