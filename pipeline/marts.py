@@ -1288,6 +1288,35 @@ def _build_mart2(raw_visits: pd.DataFrame, as_of_date: pd.Timestamp) -> pd.DataF
     ).reset_index(drop=True)
 
 
+def current_regimen(raw_visits: pd.DataFrame, as_of_date) -> pd.DataFrame:
+    """Each customer's Current Regimen as of `as_of_date` (see CONTEXT.md
+    "Current Regimen"): the (고객ID, 약품ID) pairs dispensed on their
+    Anchoring Visit -- their most recent visit at or before `as_of_date`,
+    picked the same way `_mart1_x_features` picks it (same-day visits keep
+    their first-appearance order, the last one anchors). Track 1 demand
+    multiplies only these pairs' Mart 2 amounts; Mart 2 itself still holds
+    every drug a customer has ever been dispensed.
+
+    Returns one row per pair, columns [고객ID, 약품ID], for every customer
+    with a visit at or before `as_of_date` -- Chronic or not; the caller
+    narrows the population.
+    """
+    as_of_date = pd.Timestamp(as_of_date)
+    visits = _one_row_per_visit(raw_visits, [CUSTOMER_ID_COL, VISIT_DATE_COL])
+    visits[VISIT_DATE_COL] = pd.to_datetime(visits[VISIT_DATE_COL])
+    anchoring_visit_ids = (
+        visits[visits[VISIT_DATE_COL] <= as_of_date]
+        .sort_values([CUSTOMER_ID_COL, VISIT_DATE_COL], kind="stable")
+        .groupby(CUSTOMER_ID_COL, sort=False)
+        .tail(1)
+        .index
+    )
+    regimen = raw_visits.loc[
+        raw_visits[VISIT_ID_COL].isin(anchoring_visit_ids), [CUSTOMER_ID_COL, DRUG_ID_COL]
+    ].dropna(subset=[DRUG_ID_COL])
+    return regimen.drop_duplicates().reset_index(drop=True)
+
+
 def _seasons_for(dates: pd.Series) -> pd.Series:
     """Each date's 계절 (season), per `_MONTH_TO_SEASON`."""
     return dates.dt.month.map(_MONTH_TO_SEASON)

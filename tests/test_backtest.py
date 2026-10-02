@@ -132,8 +132,10 @@ def test_wape_matches_hand_computed_value():
             ),
         ]
         + [
+            # Dispensed on the Anchoring Visit (visit 11) alongside drug 901,
+            # so 501 is in customer 1's Current Regimen (issue #30).
             make_visit_row(
-                조제판매ID=50, 고객ID=1, 내방일="2023-06-01", 약품ID=501, 소모량=40.0
+                조제판매ID=11, 고객ID=1, 내방일="2023-11-15", 약품ID=501, 소모량=40.0
             ),
             # Day 1's actual: a one-off customer dispensed on 2024-01-15
             # (target date for as-of 2024-01-14).

@@ -25,7 +25,9 @@ from pipeline.marts import (
     CUSTOMER_ID_COL,
     DRUG_ID_COL,
     DRUG_NAME_COL,
+    LONG_TERM_MED_DAYS_COL,
     SNAPSHOT_DATE_COL,
+    build_marts,
 )
 
 
@@ -309,6 +311,139 @@ def test_track1_drug_demand_excludes_acute_customers_entirely():
 
     assert 777 not in set(result.drug_demand[DRUG_ID_COL])
     assert 501 in set(result.drug_demand[DRUG_ID_COL])
+
+
+# --- Current Regimen scoping (issue #30, see CONTEXT.md "Current Regimen"
+# and docs/adr/0005): Track 1 demand only counts drugs on each customer's
+# Anchoring Visit, never every drug in their Mart 2 history. ---
+
+
+def _chronic_customer_whose_earlier_drug_dropped_off(
+    earlier_drug_id: int, latest_drug_ids: list[int]
+) -> pd.DataFrame:
+    """Chronic customer 1 (Revisit Match on drug 101) who was dispensed
+    `earlier_drug_id` on 2023-12-15, then on their latest visit (2024-01-01,
+    the as-of date) only `latest_drug_ids` -- one raw row each, consumption
+    40.0 -- so `earlier_drug_id` is in Mart 2 but not the Current Regimen."""
+    return make_raw_visits(
+        make_high_frequency_filler_visits()
+        + make_independent_chronic_match_visits(customer_id=1, drug_id=101, visit_id_start=10)
+        + [
+            make_visit_row(
+                조제판매ID=50, 고객ID=1, 내방일="2023-12-15", 약품ID=earlier_drug_id, 소모량=25.0
+            )
+        ]
+        + [
+            make_visit_row(조제판매ID=100, 고객ID=1, 내방일="2024-01-01", 약품ID=drug_id, 소모량=40.0)
+            for drug_id in latest_drug_ids
+        ]
+    )
+
+
+def test_drugs_that_dropped_off_the_regimen_contribute_no_ordinary_demand():
+    raw_visits = _chronic_customer_whose_earlier_drug_dropped_off(
+        earlier_drug_id=601, latest_drug_ids=[501]
+    )
+    model = StubModel([0.5])
+
+    result = run_track1_inference(
+        raw_visits,
+        as_of_date="2024-01-01",
+        model=model,
+        chronic_visit_prob_cutoff=0.3,
+        rare_drug_patient_threshold=1,  # ordinary expected value, not allocation
+    )
+
+    demand = result.drug_demand.set_index(DRUG_ID_COL)[TRACK1_DEMAND_COL]
+    # 601 (2023-12-15) and 101 (the Revisit Match pair) are still in Mart 2,
+    # but not on the Anchoring Visit -- they contribute nothing.
+    assert set(demand.index) == {501}
+    assert demand.loc[501] == 0.5 * 40.0
+
+
+def test_drugs_that_dropped_off_the_regimen_get_no_rare_drug_allocation():
+    raw_visits = _chronic_customer_whose_earlier_drug_dropped_off(
+        earlier_drug_id=601, latest_drug_ids=[501]
+    )
+    model = StubModel([0.9])  # clears the cutoff
+
+    result = run_track1_inference(
+        raw_visits, as_of_date="2024-01-01", model=model, chronic_visit_prob_cutoff=0.3
+    )
+
+    demand = result.drug_demand.set_index(DRUG_ID_COL)[TRACK1_DEMAND_COL]
+    # Every drug here is rare (1 Chronic patient, below the default
+    # threshold), so a qualifying customer's full amount is allocated -- but
+    # only for 501, the one drug on their Anchoring Visit.
+    assert set(demand.index) == {501}
+    assert demand.loc[501] == 40.0
+
+
+def test_every_drug_on_the_anchoring_visit_contributes():
+    raw_visits = _chronic_customer_whose_earlier_drug_dropped_off(
+        earlier_drug_id=601, latest_drug_ids=[501, 502]
+    )
+    model = StubModel([0.5])
+
+    result = run_track1_inference(
+        raw_visits,
+        as_of_date="2024-01-01",
+        model=model,
+        chronic_visit_prob_cutoff=0.3,
+        rare_drug_patient_threshold=1,
+    )
+
+    demand = result.drug_demand.set_index(DRUG_ID_COL)[TRACK1_DEMAND_COL]
+    assert demand.to_dict() == {501: 20.0, 502: 20.0}
+
+
+def test_regimen_is_read_as_of_the_snapshot_not_from_later_visits():
+    raw_visits = _chronic_customer_whose_earlier_drug_dropped_off(
+        earlier_drug_id=601, latest_drug_ids=[501]
+    )
+    model = StubModel([0.5])
+
+    # As of 2023-12-20 the 2023-12-15 visit (drug 601) is the Anchoring
+    # Visit; the 2024-01-01 visit hasn't happened yet.
+    result = run_track1_inference(
+        raw_visits,
+        as_of_date="2023-12-20",
+        model=model,
+        chronic_visit_prob_cutoff=0.3,
+        rare_drug_patient_threshold=1,
+    )
+
+    demand = result.drug_demand.set_index(DRUG_ID_COL)[TRACK1_DEMAND_COL]
+    assert demand.to_dict() == {601: 0.5 * 25.0}
+
+
+def test_regimen_comes_from_the_same_same_day_visit_that_anchors_mart1():
+    # Two visits on the as-of date: Mart 1's features and the Current
+    # Regimen must anchor on the same one (the later-appearing visit 101),
+    # or probabilities and demand would describe different visits.
+    raw_visits = make_raw_visits(
+        make_high_frequency_filler_visits()
+        + make_independent_chronic_match_visits(customer_id=1, drug_id=101, visit_id_start=10)
+        + [
+            make_visit_row(
+                조제판매ID=100, 고객ID=1, 내방일="2024-01-01", 약품ID=501, 투약일수=30, 소모량=40.0
+            ),
+            make_visit_row(
+                조제판매ID=101, 고객ID=1, 내방일="2024-01-01", 약품ID=502, 투약일수=60, 소모량=40.0
+            ),
+        ]
+    )
+
+    mart1 = build_marts(raw_visits, as_of_date="2024-01-01").mart1
+    result = run_track1_inference(
+        raw_visits,
+        as_of_date="2024-01-01",
+        model=StubModel([0.5]),
+        rare_drug_patient_threshold=1,
+    )
+
+    assert mart1.set_index(CUSTOMER_ID_COL).loc[1, LONG_TERM_MED_DAYS_COL] == 60
+    assert set(result.drug_demand[DRUG_ID_COL]) == {502}
 
 
 def test_drug_demand_output_columns_and_snapshot_date():

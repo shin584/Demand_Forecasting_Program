@@ -35,6 +35,7 @@ from .marts import (
     WEEKDAY_COL,
     build_marts,
     chronic_rare_drug_ids,
+    current_regimen,
     season_and_weekday_for,
 )
 from .model import CHRONIC_VISIT_PROB_CUTOFF, prepare_track1_features
@@ -108,12 +109,14 @@ def run_track1_inference(
 
     `drug_demand` (`TRACK1_DEMAND_COLUMNS`: 기준일자, 약품ID, track1_기댓값) is
     the ordinary expected-value formula -- probability x Mart 2 latest
-    consumption, summed per drug across every Chronic customer who has a
-    Mart 2 row for it -- for most drugs. A drug with fewer than
-    `rare_drug_patient_threshold` distinct Chronic patients (trailing 12
-    months, see `pipeline.marts.chronic_rare_drug_ids`) instead uses the
-    100%-allocation rule: the sum of each qualifying customer's full latest
-    Mart 2 consumption, "qualifying" meaning predicted probability
+    consumption, summed per drug across every Chronic customer whose Current
+    Regimen (the drugs on their Anchoring Visit, see
+    `pipeline.marts.current_regimen`) includes it -- for most drugs. A drug
+    with fewer than `rare_drug_patient_threshold` distinct Chronic patients
+    (trailing 12 months, see `pipeline.marts.chronic_rare_drug_ids`) instead
+    uses the 100%-allocation rule: the sum of each qualifying customer's
+    full latest Mart 2 consumption for that drug, again only where it's in
+    their Current Regimen, "qualifying" meaning predicted probability
     `>= chronic_visit_prob_cutoff` (see CONTEXT.md "Track 1 Rare-Drug
     Allocation" and docs/adr/0004). Every ordinary-drug customer contributes
     via the expected-value formula regardless of `chronic_visit_prob_cutoff`
@@ -209,8 +212,11 @@ def _track1_drug_demand(
     rare_drug_patient_threshold: int,
 ) -> pd.DataFrame:
     """Track 1's per-drug expected demand, summed per drug across every
-    Chronic customer who has a Mart 2 row for it (see CONTEXT.md "Track 1
-    Rare-Drug Allocation").
+    Chronic customer whose Current Regimen includes it (see CONTEXT.md
+    "Current Regimen" and "Track 1 Rare-Drug Allocation"). Only Mart 2 rows
+    for drugs on the customer's Anchoring Visit count: a drug they were
+    dispensed earlier but not on that visit contributes nothing, under
+    either formula below.
 
     Most drugs use the ordinary expected-value formula: probability x Mart 2
     latest consumption. A drug with fewer than `rare_drug_patient_threshold`
@@ -223,7 +229,8 @@ def _track1_drug_demand(
     multiplication is never applied to a drug once it's below the threshold.
 
     `mart2` covers every customer (Chronic and Acute alike, per
-    `build_marts`), but only Chronic customers -- the ones in `customer_ids`,
+    `build_marts`) and every drug they've ever been dispensed, but only
+    Chronic customers -- the ones in `customer_ids`,
     Mart 1's own population -- have a predicted probability at all; an Acute
     customer's Mart 2 row maps to no probability (NaN) and is dropped below
     either way, so only Chronic consumption ever contributes here.
@@ -233,21 +240,24 @@ def _track1_drug_demand(
         raw_visits, as_of_date, chronic_customer_ids, rare_drug_patient_threshold
     )
 
+    regimen_consumption = mart2.merge(
+        current_regimen(raw_visits, as_of_date), on=[CUSTOMER_ID_COL, DRUG_ID_COL]
+    )
     probability_by_customer = pd.Series(probabilities.to_numpy(), index=customer_ids.to_numpy())
-    matched_probability = mart2[CUSTOMER_ID_COL].map(probability_by_customer)
-    is_rare_drug = mart2[DRUG_ID_COL].isin(rare_drug_ids)
+    matched_probability = regimen_consumption[CUSTOMER_ID_COL].map(probability_by_customer)
+    is_rare_drug = regimen_consumption[DRUG_ID_COL].isin(rare_drug_ids)
 
-    ordinary_demand = matched_probability * mart2[MART2_VALUE_COL]
+    ordinary_demand = matched_probability * regimen_consumption[MART2_VALUE_COL]
     # NaN (rather than 0.0) below cutoff -- dropped by the dropna below, the
     # same "doesn't contribute at all" treatment an Acute customer's NaN
     # probability already gets, rather than a separate zero-value row.
-    rare_allocation = mart2[MART2_VALUE_COL].where(
+    rare_allocation = regimen_consumption[MART2_VALUE_COL].where(
         matched_probability >= chronic_visit_prob_cutoff
     )
     per_row_demand = rare_allocation.where(is_rare_drug, ordinary_demand)
 
     demand = (
-        pd.DataFrame({DRUG_ID_COL: mart2[DRUG_ID_COL], TRACK1_DEMAND_COL: per_row_demand})
+        pd.DataFrame({DRUG_ID_COL: regimen_consumption[DRUG_ID_COL], TRACK1_DEMAND_COL: per_row_demand})
         .dropna(subset=[TRACK1_DEMAND_COL])
         .groupby(DRUG_ID_COL, as_index=False)[TRACK1_DEMAND_COL]
         .sum()

@@ -182,6 +182,22 @@ def test_mart2_is_per_customer_and_drug():
     assert value.loc[(2, 1)] == 99.0
 
 
+def test_mart2_keeps_drugs_that_dropped_off_the_current_regimen():
+    # Track 1 demand scopes to the Current Regimen (issue #30), but Mart 2
+    # itself is unchanged: drug 1, absent from the latest visit, keeps its row.
+    raw_visits = make_raw_visits(
+        [
+            make_visit_row(조제판매ID=1, 고객ID=1, 내방일="2024-01-01", 약품ID=1, 소모량=30.0),
+            make_visit_row(조제판매ID=2, 고객ID=1, 내방일="2024-02-01", 약품ID=2, 소모량=15.0),
+        ]
+    )
+
+    mart2 = build_marts(raw_visits, as_of_date="2024-02-01").mart2
+
+    expected = pd.DataFrame({"고객ID": [1, 1], "약품ID": [1, 2], "최근소모량": [30.0, 15.0]})
+    pd.testing.assert_frame_equal(mart2, expected, check_dtype=False)
+
+
 def test_mart1_includes_only_chronic_patients_and_derives_chronic_flag():
     raw_visits = make_raw_visits(
         make_high_frequency_filler_visits()
