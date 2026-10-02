@@ -11,6 +11,7 @@ from pipeline.marts import (
     MART1_COLUMNS,
     MART1_NON_FEATURE_COLS,
     MART1_NUMERIC_FEATURE_COLS,
+    LAPSE_HORIZON_DAYS,
     MART1_TRAINING_COLUMNS,
     SNAPSHOT_DATE_COL,
     build_mart1_training_set,
@@ -126,8 +127,9 @@ def test_rows_before_the_chronic_since_date_are_dropped():
 
 def test_returns_empty_frame_when_every_row_predates_the_chronic_since_date():
     # The match is only observed on the customer's last visit: every positive
-    # is dated the day before a visit, and no negative is anchored on the
-    # last visit, so nothing is left on or after 2024-02-15.
+    # is dated the day before a visit, and the last visit is also the
+    # extract's last 내방일, so every negative it anchors would fall past the
+    # extract's end. Nothing is left on or after 2024-02-15.
     raw_visits = make_raw_visits(make_high_frequency_filler_visits(_FILLER_OCCURRENCES) + _chronic_customer_history()[:2])
 
     training_set = build_mart1_training_set(raw_visits)
@@ -316,16 +318,16 @@ def test_no_row_is_dated_on_or_after_the_extracts_last_visit():
 
 
 def test_a_sample_on_or_after_the_extracts_last_visit_is_dropped(monkeypatch):
-    # Negative Sampling never dates a row that late today; this pins the
-    # guard for a future sampling change that would (a row dated on the last
+    # Negative Sampling applies the same bound itself; this pins the
+    # training set's own guard for a future sampling change that wouldn't (a row dated on the last
     # 내방일 has its label on the day after the extract ends).
     import pipeline.marts as marts
 
     raw_visits = make_raw_visits(make_high_frequency_filler_visits(_FILLER_OCCURRENCES) + _chronic_customer_history())
     real_sampler = marts.sample_mart1_negatives
 
-    def sampler_with_late_rows(raw_visits, chronic_customer_ids=None):
-        negatives = real_sampler(raw_visits, chronic_customer_ids)
+    def sampler_with_late_rows(raw_visits, chronic_customer_ids=None, lapse_horizon_days=LAPSE_HORIZON_DAYS):
+        negatives = real_sampler(raw_visits, chronic_customer_ids, lapse_horizon_days)
         late = negatives.iloc[[0, 0]].assign(
             기준일자=[pd.Timestamp("2024-04-20"), pd.Timestamp("2024-04-25")]
         )

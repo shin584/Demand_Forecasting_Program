@@ -213,9 +213,12 @@ BASELINE_WEIGHT = 1.0
 # Windows" and docs/Research-Log.md's absolute-day 초기(1~5일차)/중기(15일차)/
 # 말기(27~29일차) scheme this generalizes into proportions of each patient's
 # own 처방조제일수 cycle length): ~15% early, ~50% mid, ~90-96% late (up to 3
-# samples). 1 early + 1 mid + 3 late, against 1 assumed positive per cycle,
-# is what produces the accepted ~1:5 ratio -- not the superseded "1:3" figure.
+# samples), then post-cycle multiples so the model sees overdue customers who
+# don't come back (see ADR-0005 "Post-cycle negatives"), plus one sample the
+# day before the Lapse Horizon. The ~1:5 positive:negative ratio the
+# in-cycle fractions once produced is no longer a target.
 NEGATIVE_SAMPLE_FRACTIONS = (0.15, 0.50, 0.90, 0.93, 0.96)
+POST_CYCLE_NEGATIVE_SAMPLE_MULTIPLES = (1.25, 1.5, 2.0, 3.0, 4.0)
 
 MART1_NEGATIVE_SAMPLE_COLUMNS = [
     CUSTOMER_ID_COL,
@@ -348,7 +351,7 @@ def build_mart1_training_set(
     samples = pd.concat(
         [
             _mart1_positive_samples(raw_visits, chronic_customer_ids),
-            sample_mart1_negatives(raw_visits, chronic_customer_ids),
+            sample_mart1_negatives(raw_visits, chronic_customer_ids, lapse_horizon_days),
         ],
         ignore_index=True,
     )
@@ -681,51 +684,61 @@ def _eligibility_flag_mask(column: pd.Series) -> pd.Series:
     return column.astype("string").str.strip().str.upper().eq("Y").fillna(False)
 
 
-def negative_sample_offsets(prescription_days: float) -> list[int]:
+def negative_sample_offsets(
+    prescription_days: float, lapse_horizon_days: int = LAPSE_HORIZON_DAYS
+) -> list[int]:
     """Day-offsets (relative to an anchoring visit) for Mart 1's Y=0
     negative-sampling scheme (see CONTEXT.md "Negative Sampling Windows").
 
     Offsets are proportions of `prescription_days` - that visit's own
     처방조제일수 cycle length - rather than fixed absolute days, so sampling
-    stays meaningful whether the observed cycle is 7 days or 60+. Every
-    offset is >=1 day so no negative sample can land on or before the
-    anchoring visit itself; offsets a short cycle rounds onto the same day
-    are collapsed, so a very short cycle yields fewer than 5 samples.
+    stays meaningful whether the observed cycle is 7 days or 60+: in-cycle
+    at 15/50/90/93/96%, post-cycle at 1.25/1.5/2/3/4x, plus one sample the
+    day before the Lapse Horizon. Every offset is >=1 day so no negative
+    sample can land on or before the anchoring visit itself, and none lies
+    beyond `lapse_horizon_days`, where the customer is Lapsed and never
+    scored; offsets a short cycle rounds onto the same day are collapsed.
     """
     offsets = {
         max(1, round(prescription_days * fraction))
-        for fraction in NEGATIVE_SAMPLE_FRACTIONS
+        for fraction in NEGATIVE_SAMPLE_FRACTIONS + POST_CYCLE_NEGATIVE_SAMPLE_MULTIPLES
     }
-    return sorted(offsets)
+    offsets.add(lapse_horizon_days - 1)
+    return sorted(offset for offset in offsets if offset <= lapse_horizon_days)
 
 
-def negative_sample_dates(visit_date, prescription_days: float) -> list[pd.Timestamp]:
+def negative_sample_dates(
+    visit_date, prescription_days: float, lapse_horizon_days: int = LAPSE_HORIZON_DAYS
+) -> list[pd.Timestamp]:
     """Candidate Mart 1 Y=0 snapshot dates for one anchoring visit, via the
-    early/mid/late window scheme (see negative_sample_offsets)."""
+    in-cycle/post-cycle scheme (see negative_sample_offsets)."""
     visit_date = pd.Timestamp(visit_date)
     return [
         visit_date + pd.Timedelta(days=offset)
-        for offset in negative_sample_offsets(prescription_days)
+        for offset in negative_sample_offsets(prescription_days, lapse_horizon_days)
     ]
 
 
 def sample_mart1_negatives(
-    raw_visits: pd.DataFrame, chronic_customer_ids: set | None = None
+    raw_visits: pd.DataFrame,
+    chronic_customer_ids: set | None = None,
+    lapse_horizon_days: int = LAPSE_HORIZON_DAYS,
 ) -> pd.DataFrame:
-    """Mart 1's Y=0 negative-sample rows, via the early/mid/late window
-    scheme, for every Chronic Patient (see ADR-0001) patient-cycle - a visit
-    that has a later visit by the same customer, bounding the cycle the
-    offsets are sampled within.
+    """Mart 1's Y=0 negative-sample rows, via the in-cycle/post-cycle
+    scheme (see negative_sample_offsets), anchored on every visit by a
+    Chronic Patient (see ADR-0001) - including each customer's last known
+    visit, so the model sees customers who are overdue and don't come back.
 
     One row per (anchoring visit, sampled offset), dated that visit's own
     내방일 plus the offset, kept only if it's at least two days before the
     anchoring visit's next visit (the customer's earliest visit on a later
     date): a sample on the day before it would actually be a Next-Day Visit
     positive, and one on or after it describes a cycle that's already over.
-    That bound is what makes the Y=0 label true, not just assumed. A
-    customer's chronologically last known visit date never anchors a cycle -
-    it has no later visit, so there's nothing to bound the sampling window
-    with.
+    It must also be dated before the extract's last 내방일, so "no visit on
+    기준일자 + 1" is still observed -- the only bound on samples anchored by
+    a customer's last visit, besides the Lapse Horizon the offsets already
+    stop at. Those bounds are what make the Y=0 label true, not just
+    assumed.
     `chronic_customer_ids` can be passed in to reuse a result already
     computed by `build_marts`; otherwise it's derived here via
     `revisit_match`.
@@ -741,6 +754,7 @@ def sample_mart1_negatives(
     if not chronic_customer_ids:
         return pd.DataFrame(columns=MART1_NEGATIVE_SAMPLE_COLUMNS)
 
+    extract_end = pd.to_datetime(raw_visits[VISIT_DATE_COL]).max()
     visits = _one_row_per_visit(
         raw_visits, [CUSTOMER_ID_COL, VISIT_DATE_COL, PRESCRIPTION_DAYS_COL]
     ).reset_index()
@@ -755,28 +769,31 @@ def sample_mart1_negatives(
     visits = visits.sort_values(["_customer_order", VISIT_DATE_COL], kind="stable")
     # Each visit's next visit: the customer's earliest visit on a strictly
     # later date (a same-day visit isn't one). Visits on a customer's last
-    # date have none and anchor nothing.
+    # date have none (NaT), so only the extract's end bounds them.
     visit_days = visits[[CUSTOMER_ID_COL, VISIT_DATE_COL]].drop_duplicates()
     visit_days = visit_days.assign(
         _next_visit_date=visit_days.groupby(CUSTOMER_ID_COL)[VISIT_DATE_COL].shift(-1)
     )
     anchors = visits.merge(visit_days, on=[CUSTOMER_ID_COL, VISIT_DATE_COL], how="left")
-    anchors = anchors[anchors["_next_visit_date"].notna()].reset_index(drop=True)
 
     # negative_sample_offsets, vectorized: np.rint rounds half-to-even exactly
-    # like the built-in round() it uses.
+    # like the built-in round() it uses. Offsets past the horizon are masked
+    # to NaN and dropped once stacked.
     offsets = np.maximum(
         1,
         np.rint(
             np.outer(
                 anchors[PRESCRIPTION_DAYS_COL].to_numpy(dtype=float),
-                NEGATIVE_SAMPLE_FRACTIONS,
+                NEGATIVE_SAMPLE_FRACTIONS + POST_CYCLE_NEGATIVE_SAMPLE_MULTIPLES,
             )
         ),
     )
+    offsets = np.column_stack([offsets, np.full(len(anchors), lapse_horizon_days - 1)])
+    offsets = np.where(offsets <= lapse_horizon_days, offsets, np.nan)
     samples = (
         pd.DataFrame(offsets)
         .stack()
+        .dropna()
         .rename("_offset")
         .reset_index(level=1, drop=True)
         .rename_axis("_anchor")
@@ -788,7 +805,13 @@ def sample_mart1_negatives(
     snapshot_dates = anchor_rows[VISIT_DATE_COL] + pd.to_timedelta(
         samples["_offset"].to_numpy(), unit="D"
     )
-    is_true_negative = snapshot_dates < anchor_rows["_next_visit_date"] - pd.Timedelta(days=1)
+    # A visit on the customer's last date has no next visit, so the
+    # extract's end alone bounds its samples.
+    next_visit_dates = anchor_rows["_next_visit_date"]
+    is_before_day_before_next_visit = next_visit_dates.isna() | (
+        snapshot_dates < next_visit_dates - pd.Timedelta(days=1)
+    )
+    is_true_negative = is_before_day_before_next_visit & (snapshot_dates < extract_end)
     return pd.DataFrame(
         {
             CUSTOMER_ID_COL: anchor_rows[CUSTOMER_ID_COL],

@@ -108,9 +108,10 @@ def test_training_set_drops_a_positive_whose_customer_is_lapsed_as_of_it(gap_day
 
 def test_training_set_drops_negatives_past_the_lapse_horizon():
     # A 300-day cycle anchored on the visit that makes customer 1 Chronic:
-    # its early/mid negatives (+45, +150 days) are within the horizon, its
-    # late ones (+270, +279, +288) are not. The first visit's own negatives
-    # all predate the Chronic-since Date.
+    # its early/mid negatives (+45, +150 days) and the day-before-horizon
+    # one (+179) are within the horizon, its late and post-cycle ones
+    # (+270 and later) are not. The first visit's own negatives all predate
+    # the Chronic-since Date.
     raw_visits = make_raw_visits(
         make_high_frequency_filler_visits(_FILLER_OCCURRENCES)
         + _chronic_customer(last_visit_prescription_days=300)
@@ -123,4 +124,5 @@ def test_training_set_drops_negatives_past_the_lapse_horizon():
     assert sorted(negatives[SNAPSHOT_DATE_COL]) == [
         _LAST_VISIT + pd.Timedelta(days=45),
         _LAST_VISIT + pd.Timedelta(days=150),
+        _LAST_VISIT + pd.Timedelta(days=179),
     ]

@@ -12,8 +12,9 @@ from pipeline.marts import (
 def test_offsets_fall_into_early_mid_and_late_bands_of_the_cycle():
     # A 90-day cycle keeps every fraction's rounded offset distinct, so the
     # early/1-mid/late(2-3) shape from CONTEXT.md's "Negative Sampling
-    # Windows" is directly countable.
-    offsets = negative_sample_offsets(90)
+    # Windows" is directly countable. Only the in-cycle offsets (< 90) are
+    # checked here; post-cycle ones are covered below.
+    offsets = [o for o in negative_sample_offsets(90) if o < 90]
 
     early = [o for o in offsets if o <= 0.25 * 90]
     mid = [o for o in offsets if 0.4 * 90 < o <= 0.6 * 90]
@@ -23,6 +24,23 @@ def test_offsets_fall_into_early_mid_and_late_bands_of_the_cycle():
     assert len(mid) == 1
     assert 2 <= len(late) <= 3
     assert len(offsets) == len(early) + len(mid) + len(late)
+
+
+def test_offsets_continue_past_the_cycle_up_to_just_before_the_lapse_horizon():
+    # In-cycle 15/50/90/93/96%, post-cycle 1.25/1.5/2/3/4x, and the day
+    # before the 180-day Lapse Horizon.
+    assert negative_sample_offsets(30) == [4, 15, 27, 28, 29, 38, 45, 60, 90, 120, 179]
+
+
+def test_offsets_beyond_the_lapse_horizon_are_dropped():
+    # 4 x 60 = 240 days is past the horizon; 3 x 60 = 180 is the horizon's
+    # last day and still within it.
+    assert negative_sample_offsets(60) == [9, 30, 54, 56, 58, 75, 90, 120, 179, 180]
+    assert max(negative_sample_offsets(30, lapse_horizon_days=100)) == 99
+
+
+def test_duplicate_offsets_are_collapsed():
+    assert negative_sample_offsets(1) == [1, 2, 3, 4, 179]
 
 
 def test_offsets_scale_with_the_patient_own_prescription_days_not_fixed_absolute_days():
@@ -72,10 +90,15 @@ def test_sample_mart1_negatives_for_a_synthetic_chronic_patient():
     negatives = sample_mart1_negatives(raw_visits)
 
     assert list(negatives.columns) == MART1_NEGATIVE_SAMPLE_COLUMNS
-    # Only the first visit anchors a cycle - it has a later visit; the
-    # second visit is customer 1's last known visit, so it anchors nothing.
+    # The first visit's samples stop two days before its next visit. The
+    # second visit is also the extract's last 내방일, so the samples it
+    # anchors would all fall past the extract's end.
     customer_1 = negatives[negatives["고객ID"] == 1]
-    expected_dates = set(negative_sample_dates("2024-01-01", 90))
+    expected_dates = {
+        date
+        for date in negative_sample_dates("2024-01-01", 90)
+        if date < pd.Timestamp("2024-03-30")
+    }
     assert set(customer_1["기준일자"]) == expected_dates
     assert (customer_1["내일_방문"] == False).all()  # noqa: E712
     assert (customer_1["조제판매ID"] == 1).all()
@@ -94,50 +117,6 @@ def test_sample_mart1_negatives_excludes_acute_patients():
 
     assert negatives.empty
     assert list(negatives.columns) == MART1_NEGATIVE_SAMPLE_COLUMNS
-
-
-def test_negative_to_positive_ratio_is_approximately_1_to_5_across_a_dataset():
-    # Four independent chronic patient-cycles, each with a distinct
-    # 처방조제일수 long enough to avoid rounding collisions between the
-    # scheme's fractions. The scheme's job is to produce ~5 negatives per
-    # cycle against the 1 positive each cycle's actual next visit supplies
-    # elsewhere (Next-Day Visit label), i.e. the accepted ~1:5 ratio - not
-    # the superseded "1:3" figure.
-    cycles = [
-        (1, "2024-01-01", 90, "2024-04-15"),
-        (2, "2024-01-01", 60, "2024-03-15"),
-        (3, "2024-01-01", 45, "2024-03-01"),
-        (4, "2024-01-01", 120, "2024-05-15"),
-    ]
-    rows = make_high_frequency_filler_visits()
-    visit_id = 1
-    for customer_id, visit_date, prescription_days, next_expected in cycles:
-        rows.append(
-            make_visit_row(
-                조제판매ID=visit_id,
-                고객ID=customer_id,
-                내방일=visit_date,
-                처방조제일수=prescription_days,
-                다음내방일=next_expected,
-                약품ID=customer_id,
-            )
-        )
-        visit_id += 1
-        rows.append(
-            make_visit_row(
-                조제판매ID=visit_id, 고객ID=customer_id, 내방일=next_expected, 약품ID=customer_id
-            )
-        )
-        visit_id += 1
-    raw_visits = make_raw_visits(rows)
-
-    negatives = sample_mart1_negatives(raw_visits)
-
-    positives_per_cycle = 1
-    total_positives = positives_per_cycle * len(cycles)
-    assert len(negatives) == 5 * len(cycles)
-    ratio = total_positives / len(negatives)
-    assert ratio == 1 / 5
 
 
 def _two_visit_chronic_customer(prescription_days, next_visit_date):
@@ -211,3 +190,65 @@ def test_same_day_visits_are_bounded_by_the_next_later_visit_date():
 
     assert set(negatives["조제판매ID"]) == {1, 2}
     assert negatives["기준일자"].max() < pd.Timestamp("2024-02-19")
+
+
+def test_post_cycle_negatives_stop_two_days_before_the_next_visit():
+    # 처방조제일수=30 samples days 4/15/27/28/29 in-cycle and 38/45/60/90/120
+    # and 179 after it. The customer comes back on day 61, so the day-60
+    # sample's customer visits on 기준일자 + 1 -- not a negative.
+    raw_visits = _two_visit_chronic_customer(30, "2024-03-02")
+
+    negatives = sample_mart1_negatives(raw_visits)
+
+    anchored_on_first = negatives[negatives["조제판매ID"] == 1]
+    offsets = (anchored_on_first["기준일자"] - pd.Timestamp("2024-01-01")).dt.days
+    assert list(offsets) == [4, 15, 27, 28, 29, 38, 45]
+
+
+def _chronic_customer_whose_last_visit_is_followed_by(extract_end):
+    # Customer 1 last visits on 2024-03-31 (처방조제일수=30); an unrelated
+    # customer's visit on `extract_end` sets the extract's last 내방일.
+    return make_raw_visits(
+        make_high_frequency_filler_visits()
+        + [
+            make_visit_row(
+                조제판매ID=1, 고객ID=1, 내방일="2024-01-01", 처방조제일수=90,
+                다음내방일="2024-03-31", 약품ID=1,
+            ),
+            make_visit_row(조제판매ID=2, 고객ID=1, 내방일="2024-03-31", 처방조제일수=30, 약품ID=1),
+            make_visit_row(조제판매ID=3, 고객ID=2, 내방일=extract_end, 약품ID=2),
+        ]
+    )
+
+
+def test_a_customers_last_visit_anchors_samples_up_to_the_lapse_horizon():
+    raw_visits = _chronic_customer_whose_last_visit_is_followed_by("2024-12-31")
+
+    negatives = sample_mart1_negatives(raw_visits)
+
+    anchored_on_last = negatives[negatives["조제판매ID"] == 2]
+    assert set(anchored_on_last["기준일자"]) == set(negative_sample_dates("2024-03-31", 30))
+    assert (anchored_on_last["내일_방문"] == False).all()  # noqa: E712
+
+
+def test_samples_anchored_on_a_last_visit_stop_before_the_extracts_end():
+    # The extract ends 61 days after the last visit: the day-60 sample's
+    # Next-Day label (no visit on day 61) is still inside the data, the
+    # day-90 one's isn't.
+    raw_visits = _chronic_customer_whose_last_visit_is_followed_by("2024-05-31")
+
+    negatives = sample_mart1_negatives(raw_visits)
+
+    anchored_on_last = negatives[negatives["조제판매ID"] == 2]
+    offsets = (anchored_on_last["기준일자"] - pd.Timestamp("2024-03-31")).dt.days
+    assert list(offsets) == [4, 15, 27, 28, 29, 38, 45, 60]
+
+
+def test_lapse_horizon_bounds_the_sampled_offsets():
+    raw_visits = _chronic_customer_whose_last_visit_is_followed_by("2024-12-31")
+
+    negatives = sample_mart1_negatives(raw_visits, lapse_horizon_days=100)
+
+    anchored_on_last = negatives[negatives["조제판매ID"] == 2]
+    offsets = (anchored_on_last["기준일자"] - pd.Timestamp("2024-03-31")).dt.days
+    assert list(offsets) == [4, 15, 27, 28, 29, 38, 45, 60, 90, 99]
