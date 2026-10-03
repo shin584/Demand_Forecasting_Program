@@ -3,13 +3,15 @@ extract and writes the headline WAPE plus a per-drug breakdown to a report
 file (see issue #18 and `pipeline.backtest.run_backtest`).
 
 Trains Track 1's model once on `split_mart1_training_set`'s train/val split
--- sampled train rows, early-stopped against full daily validation snapshots
-(matching production's own training path, see `pipeline.model
-.train_track1_model`) -- then walks the trained model forward across the
-split's test window. A full run walks one calendar day at a time across the
-whole test window (6 months by default), rebuilding Mart 1/2/3 as of each
-day -- a few seconds per day on the v0.3 extract; pass a narrower
-`--test-dates-limit` while iterating.
+-- sampled train rows, early-stopped against, Platt-calibrated on and
+cutoff-tuned on full daily validation snapshots (matching production's own
+training path, see `pipeline.model.train_track1_model`) -- reports the test
+window's Σp against actual Chronic next-day visits, then walks the trained
+model forward across the split's test window at the tuned cutoff (the
+provisional `CHRONIC_VISIT_PROB_CUTOFF` if tuning found none). A full run
+walks one calendar day at a time across the whole test window (6 months by
+default), rebuilding Mart 1/2/3 as of each day -- a few seconds per day on
+the v0.3 extract; pass a narrower `--test-dates-limit` while iterating.
 
 Usage: python scripts/run_backtest.py [--test-dates-limit N]
 """
@@ -42,7 +44,7 @@ from pipeline.marts import (
     mart1_split_windows,
     split_mart1_training_set,
 )
-from pipeline.model import train_track1_model
+from pipeline.model import CHRONIC_VISIT_PROB_CUTOFF, train_track1_model
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 RAW_DATA_PATH = REPO_ROOT / "dataset" / "pharmacy_raw_data_v0.3.csv"
@@ -86,13 +88,37 @@ def _visit_probability_table(per_date: pd.DataFrame) -> pd.DataFrame:
     return table.astype(dtypes)
 
 
-def _write_report(path: Path, result) -> None:
+def _training_summary(trained) -> str:
+    tuning = trained.cutoff_tuning
+    targets = f"≥{tuning.min_recall:.0%} recall, ≥{tuning.min_precision:.0%} precision"
+    if tuning.cutoff is None:
+        cutoff_line = (
+            f"Chronic cutoff: none on validation meets {targets}; "
+            f"falling back to the provisional {CHRONIC_VISIT_PROB_CUTOFF}"
+        )
+    else:
+        cutoff_line = (
+            f"Chronic cutoff: {tuning.cutoff:.4f} ({targets}) -- validation "
+            f"precision {tuning.precision:.4f}, recall {tuning.recall:.4f}"
+        )
+    metrics = ", ".join(f"{name} {value:.4f}" for name, value in trained.metrics.items())
+    check = trained.sum_p_check
+    return (
+        f"Validation: {metrics}\n"
+        f"{cutoff_line}\n"
+        f"Test window: Σp {check.sum_p:.1f} vs {check.actual_visits} actual Chronic "
+        f"next-day visits (ratio {check.ratio:.3f})\n"
+    )
+
+
+def _write_report(path: Path, result, training_summary: str) -> None:
     summary = result.summary
     wape_by_date = _wape_breakdown(result.daily, SNAPSHOT_DATE_COL)
     per_drug = _wape_breakdown(result.daily, DRUG_ID_COL).sort_values(ERROR_COL, ascending=False)
 
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
+        f.write(training_summary + "\n")
         f.write(f"WAPE: {summary.wape:.4f}\n")
         f.write(f"  Track 1 WAPE: {summary.track1_wape:.4f} ")
         f.write(f"({_track_totals(result.daily, TRACK1_PREDICTED_COL, TRACK1_ACTUAL_COL)})\n")
@@ -132,8 +158,12 @@ def main() -> None:
         f"Built val/test daily snapshots in {time.perf_counter() - started:.1f}s "
         f"({len(split.val):,} val rows, {len(split.test):,} test rows)"
     )
-    trained = train_track1_model(split.train, split.val)
-    print(f"Trained Track 1 model -- val metrics: {trained.metrics}")
+    trained = train_track1_model(split.train, split.val, split.test)
+    training_summary = _training_summary(trained)
+    print(training_summary, end="")
+    cutoff = trained.cutoff_tuning.cutoff
+    if cutoff is None:
+        cutoff = CHRONIC_VISIT_PROB_CUTOFF
 
     test_dates = None
     if args.test_dates_limit is not None:
@@ -141,8 +171,10 @@ def main() -> None:
         full_range = pd.date_range(windows.test_start, windows.end, freq="D")
         test_dates = list(full_range[: args.test_dates_limit])
 
-    result = run_backtest(raw_visits, trained.model, test_dates=test_dates)
-    _write_report(REPORT_PATH, result)
+    result = run_backtest(
+        raw_visits, trained.model, test_dates=test_dates, chronic_visit_prob_cutoff=cutoff
+    )
+    _write_report(REPORT_PATH, result, training_summary)
 
     print(
         f"WAPE: {result.summary.wape:.4f} (Track 1 {result.summary.track1_wape:.4f}, "

@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+import pytest
 
 from pipeline.marts import (
     AGE_COL,
@@ -22,10 +23,15 @@ from pipeline.marts import (
     WEIGHT_COL,
 )
 from pipeline.model import (
+    CHRONIC_CUTOFF_MIN_PRECISION,
+    CHRONIC_CUTOFF_MIN_RECALL,
+    CalibratedTrack1Model,
+    PlattCalibrator,
     load_track1_model,
     prepare_track1_features,
     save_track1_model,
     train_track1_model,
+    tune_chronic_cutoff,
 )
 
 
@@ -71,15 +77,17 @@ def _train_val():
     return train, val
 
 
-def test_returns_model_and_metrics_with_expected_keys_in_range():
+def test_returns_calibrated_model_metrics_and_cutoff_tuning():
     train, val = _train_val()
 
     result = train_track1_model(train, val)
 
-    assert result.model is not None
-    assert set(result.metrics) == {"auc", "base_rate", "precision", "recall"}
+    assert isinstance(result.model, CalibratedTrack1Model)
+    assert set(result.metrics) == {"auc", "base_rate", "mean_p"}
     for value in result.metrics.values():
         assert 0.0 <= value <= 1.0
+    assert result.cutoff_tuning.min_recall == CHRONIC_CUTOFF_MIN_RECALL
+    assert result.cutoff_tuning.min_precision == CHRONIC_CUTOFF_MIN_PRECISION
 
 
 def test_learns_the_synthetic_relationship_reasonably_well():
@@ -101,21 +109,144 @@ def test_early_stopping_applied_against_validation_set():
     # LightGBM only ever receives `val` as its eval set (see
     # train_track1_model), so a best_iteration_ below the generous max round
     # count demonstrates early stopping triggered from monitoring it.
-    assert result.model.best_iteration_ is not None
-    assert result.model.best_iteration_ > 0
-    assert result.model.best_iteration_ < result.model.n_estimators
+    classifier = result.model.classifier
+    assert classifier.best_iteration_ is not None
+    assert classifier.best_iteration_ > 0
+    assert classifier.best_iteration_ < classifier.n_estimators
 
 
-def test_cutoff_argument_changes_precision_and_recall():
+def _noisy_frame(n: int, seed: int, due_visit_rate: float) -> pd.DataFrame:
+    """`_make_mart1_training_frame`, but only `due_visit_rate` of the due
+    customers (25-35 days since last visit) actually visit -- so the true
+    next-day probability for a due customer is `due_visit_rate`, not 1."""
+    frame = _make_mart1_training_frame(n, seed)
+    rng = np.random.default_rng(seed + 100)
+    frame[NEXT_DAY_VISIT_COL] = frame[NEXT_DAY_VISIT_COL] & (rng.uniform(size=n) < due_visit_rate)
+    return frame
+
+
+def test_calibrated_validation_probabilities_match_the_validation_base_rate():
+    # Train oversamples visits (every due customer visits); validation is the
+    # real distribution, where only a fifth of them do. The raw scores carry
+    # train's base rate; calibration must bring them down to validation's.
+    train = _make_mart1_training_frame(600, seed=1)
+    val = _noisy_frame(2000, seed=2, due_visit_rate=0.2)
+
+    result = train_track1_model(train, val)
+
+    X_val = prepare_track1_features(val)
+    raw_mean = result.model.classifier.predict_proba(X_val)[:, 1].mean()
+    calibrated_mean = result.model.predict_proba(X_val)[:, 1].mean()
+    base_rate = val[NEXT_DAY_VISIT_COL].mean()
+    assert raw_mean > 2 * base_rate
+    assert calibrated_mean == pytest.approx(base_rate, abs=0.01)
+    assert result.metrics["mean_p"] == pytest.approx(calibrated_mean)
+    assert result.metrics["base_rate"] == pytest.approx(base_rate)
+
+
+def test_platt_calibrator_recovers_a_known_sigmoid():
+    rng = np.random.default_rng(0)
+    raw = rng.uniform(0.01, 0.99, size=50_000)
+    true_p = 1 / (1 + np.exp(-(0.5 * np.log(raw / (1 - raw)) - 2.0)))
+    y = rng.uniform(size=raw.size) < true_p
+
+    calibrator = PlattCalibrator.fit(raw, y)
+
+    assert calibrator.slope == pytest.approx(0.5, abs=0.05)
+    assert calibrator.intercept == pytest.approx(-2.0, abs=0.1)
+    np.testing.assert_allclose(calibrator.transform(raw), true_p, atol=0.02)
+
+
+def test_platt_calibrator_stays_finite_on_perfectly_separable_scores():
+    raw = np.array([0.1, 0.2, 0.3, 0.7, 0.8, 0.9])
+    y = np.array([False, False, False, True, True, True])
+
+    calibrator = PlattCalibrator.fit(raw, y)
+
+    calibrated = calibrator.transform(raw)
+    assert np.isfinite([calibrator.slope, calibrator.intercept]).all()
+    assert (calibrated[:3] < 0.5).all() and (calibrated[3:] > 0.5).all()
+
+
+class StubModel:
+    """`predict_proba`-only stand-in returning given positive-class
+    probabilities, so a test can check exactly what calibration does to them."""
+
+    def __init__(self, probabilities):
+        self._probabilities = np.asarray(probabilities, dtype=float)
+
+    def predict_proba(self, X):
+        return np.column_stack([1 - self._probabilities, self._probabilities])
+
+
+def test_calibrated_model_applies_the_calibrator_to_raw_scores():
+    raw = np.array([0.2, 0.5, 0.9])
+    calibrator = PlattCalibrator(slope=2.0, intercept=-1.0)
+    model = CalibratedTrack1Model(classifier=StubModel(raw), calibrator=calibrator)
+
+    proba = model.predict_proba(pd.DataFrame(index=range(3)))
+
+    expected = 1 / (1 + np.exp(-(2.0 * np.log(raw / (1 - raw)) - 1.0)))
+    np.testing.assert_allclose(proba[:, 1], expected)
+    np.testing.assert_allclose(proba[:, 0], 1 - expected)
+
+
+# 10 Next-Day Visits among 20 rows: cutoff 0.9 admits 5 of them, 0.8
+# admits 7, 0.6 the same 7 plus 3 non-visits, 0.4 all 10 plus 3 non-visits,
+# 0.1 everyone.
+_TUNING_PROBA = np.array([0.9] * 5 + [0.8] * 2 + [0.6] * 3 + [0.4] * 3 + [0.1] * 7)
+_TUNING_Y = np.array([True] * 7 + [False] * 3 + [True] * 3 + [False] * 7)
+
+
+def test_tune_cutoff_picks_the_highest_cutoff_reaching_the_recall_target():
+    tuning = tune_chronic_cutoff(_TUNING_Y, _TUNING_PROBA, min_recall=0.7, min_precision=0.2)
+
+    assert tuning.cutoff == pytest.approx(0.8)
+    assert tuning.recall == pytest.approx(0.7)
+    assert tuning.precision == pytest.approx(1.0)
+
+
+def test_tune_cutoff_targets_are_overridable():
+    tuning = tune_chronic_cutoff(_TUNING_Y, _TUNING_PROBA, min_recall=0.9, min_precision=0.2)
+
+    assert tuning.cutoff == pytest.approx(0.4)
+    assert tuning.recall == pytest.approx(1.0)
+    assert tuning.precision == pytest.approx(10 / 13)
+    assert tuning.min_recall == 0.9
+    assert tuning.min_precision == 0.2
+
+
+def test_tune_cutoff_reports_clearly_when_no_cutoff_meets_both_targets():
+    # Reaching 90% recall needs cutoff 0.4 at best, where precision is 10/13.
+    with pytest.warns(UserWarning, match="No Chronic cutoff"):
+        tuning = tune_chronic_cutoff(_TUNING_Y, _TUNING_PROBA, min_recall=0.9, min_precision=0.8)
+
+    assert tuning.cutoff is None
+    assert np.isnan(tuning.precision) and np.isnan(tuning.recall)
+
+
+def test_training_reports_test_window_sum_of_probabilities_against_actual_visits():
+    train = _make_mart1_training_frame(600, seed=1)
+    val = _noisy_frame(2000, seed=2, due_visit_rate=0.2)
+    test = _noisy_frame(2000, seed=3, due_visit_rate=0.2)
+
+    result = train_track1_model(train, val, test)
+
+    expected_sum_p = result.model.predict_proba(prepare_track1_features(test))[:, 1].sum()
+    actual_visits = test[NEXT_DAY_VISIT_COL].sum()
+    assert result.sum_p_check.sum_p == pytest.approx(expected_sum_p)
+    assert result.sum_p_check.actual_visits == actual_visits
+    assert result.sum_p_check.ratio == pytest.approx(expected_sum_p / actual_visits)
+    # Same distribution as validation, so calibration should carry over.
+    assert 0.5 < result.sum_p_check.ratio < 2.0
+
+
+def test_training_without_a_test_window_reports_no_sum_p_check():
     train, val = _train_val()
 
-    lenient = train_track1_model(train, val, cutoff=0.01)
-    strict = train_track1_model(train, val, cutoff=0.99)
+    result = train_track1_model(train, val)
 
-    # A near-zero cutoff calls almost everything positive (near-perfect
-    # recall, weaker precision); a near-one cutoff does the reverse.
-    assert lenient.metrics["recall"] >= strict.metrics["recall"]
-    assert lenient.metrics["precision"] <= strict.metrics["precision"]
+    assert result.sum_p_check is None
 
 
 def _fixed_feature_vector() -> dict:
@@ -170,8 +301,10 @@ def test_sample_weight_is_threaded_into_training():
         [train, _conflict_rows(heavy_label=False, light_label=True)], ignore_index=True
     )
 
-    model_heavy_true = train_track1_model(heavy_true, val).model
-    model_heavy_false = train_track1_model(heavy_false, val).model
+    # The raw classifiers, not the calibrated models: each one's calibrator
+    # is fit separately, which this test isn't about.
+    model_heavy_true = train_track1_model(heavy_true, val).model.classifier
+    model_heavy_false = train_track1_model(heavy_false, val).model.classifier
 
     vector_row = prepare_track1_features(pd.DataFrame([_fixed_feature_vector()]))
     proba_heavy_true = model_heavy_true.predict_proba(vector_row)[0, 1]
@@ -188,6 +321,9 @@ def test_model_persists_and_reloads_to_an_equivalent_usable_model(tmp_path):
     save_track1_model(result.model, model_path)
     reloaded = load_track1_model(model_path)
 
+    # The calibrator round-trips with the classifier: reloaded probabilities
+    # are the calibrated ones, not the raw scores.
+    assert reloaded.calibrator == result.model.calibrator
     X_val = prepare_track1_features(val)
     original_proba = result.model.predict_proba(X_val)[:, 1]
     reloaded_proba = reloaded.predict_proba(X_val)[:, 1]

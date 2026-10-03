@@ -30,6 +30,7 @@ from pipeline.marts import (
     build_mart1_training_set,
     mart1_split_windows,
 )
+from pipeline.model import CalibratedTrack1Model, PlattCalibrator
 
 
 class StubModel:
@@ -343,13 +344,38 @@ def test_per_date_reports_visit_probability_sum_against_actual_chronic_visits():
 def test_per_date_visit_list_size_respects_the_cutoff():
     raw_visits = make_raw_visits(_one_chronic_customer_on_drug_501())
 
-    result = run_backtest(raw_visits, StubModel(0.2), test_dates=["2024-01-14"])
+    result = run_backtest(
+        raw_visits, StubModel(0.2), test_dates=["2024-01-14"], chronic_visit_prob_cutoff=0.3
+    )
 
     row = result.per_date.iloc[0]
     assert row[VISIT_LIST_SIZE_COL] == 0
     assert row[SCORED_POPULATION_SIZE_COL] == 1
     assert row[SUM_VISIT_PROB_COL] == pytest.approx(0.2)
     assert row[ACTUAL_CHRONIC_VISITS_COL] == 0
+
+
+def test_per_date_visit_list_size_uses_the_given_cutoff():
+    raw_visits = make_raw_visits(_one_chronic_customer_on_drug_501())
+
+    result = run_backtest(
+        raw_visits, StubModel(0.2), test_dates=["2024-01-14"], chronic_visit_prob_cutoff=0.1
+    )
+
+    assert result.per_date.iloc[0][VISIT_LIST_SIZE_COL] == 1
+
+
+def test_scores_with_calibrated_probabilities():
+    # Slope 0 maps the stub's raw 0.5 to sigmoid(intercept) = 0.05.
+    raw_visits = make_raw_visits(_one_chronic_customer_on_drug_501())
+    model = CalibratedTrack1Model(
+        classifier=StubModel(0.5),
+        calibrator=PlattCalibrator(slope=0.0, intercept=float(np.log(0.05 / 0.95))),
+    )
+
+    result = run_backtest(raw_visits, model, test_dates=["2024-01-14"])
+
+    assert result.per_date.iloc[0][SUM_VISIT_PROB_COL] == pytest.approx(0.05)
 
 
 def test_per_date_has_one_row_per_test_date():

@@ -29,6 +29,7 @@ from pipeline.marts import (
     SNAPSHOT_DATE_COL,
     build_marts,
 )
+from pipeline.model import CalibratedTrack1Model, PlattCalibrator
 
 
 class StubModel:
@@ -134,6 +135,26 @@ def test_scored_population_lists_every_scored_customer_regardless_of_cutoff():
     assert list(scored.columns) == SCORED_POPULATION_COLUMNS
     assert scored.set_index(CUSTOMER_ID_COL)[VISIT_PROB_COL].to_dict() == {1: 0.2, 2: 0.5}
     assert (scored[SNAPSHOT_DATE_COL] == pd.Timestamp("2024-01-01")).all()
+
+
+def test_scores_with_calibrated_probabilities():
+    # A calibrator with slope 0 maps every raw score to sigmoid(intercept) --
+    # here 0.05 -- so the scored probabilities can only be 0.05 if
+    # calibration was applied to the stub's raw 0.2 and 0.5.
+    raw_visits = _two_chronic_customers_with_drug_consumption(
+        "2024-01-01", drug_id=501, consumption_1=40.0, consumption_2=20.0
+    )
+    model = CalibratedTrack1Model(
+        classifier=StubModel([0.2, 0.5]),
+        calibrator=PlattCalibrator(slope=0.0, intercept=float(np.log(0.05 / 0.95))),
+    )
+
+    result = run_track1_inference(
+        raw_visits, as_of_date="2024-01-01", model=model, chronic_visit_prob_cutoff=0.04
+    )
+
+    np.testing.assert_allclose(result.scored_population[VISIT_PROB_COL], [0.05, 0.05])
+    assert sorted(result.visit_list[CUSTOMER_ID_COL]) == [1, 2]
 
 
 def test_daily_forecast_passes_scored_population_through_unchanged():

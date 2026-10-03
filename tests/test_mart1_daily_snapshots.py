@@ -219,5 +219,5 @@ def test_training_early_stops_against_the_snapshot_validation_rows():
 
     trained = train_track1_model(split.train, split.val)
 
-    assert trained.model.best_iteration_ is not None
+    assert trained.model.classifier.best_iteration_ is not None
     assert trained.metrics["base_rate"] == pytest.approx(split.val["내일_방문"].mean())

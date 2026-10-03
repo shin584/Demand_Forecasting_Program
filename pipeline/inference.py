@@ -94,8 +94,10 @@ def run_track1_inference(
     per-drug expected demand.
 
     `model` is anything exposing a scikit-learn-shaped `predict_proba(X)` --
-    a stub in tests, T1's real trained `LGBMClassifier` in production (see
-    `pipeline.model.train_track1_model`); this function has no LightGBM-
+    a stub in tests, T1's trained `CalibratedTrack1Model` in production (see
+    `pipeline.model.train_track1_model`), whose `predict_proba` already gives
+    Platt-calibrated probabilities, so the Visit List, expected-value demand
+    and rare-drug allocation all use them; this function has no LightGBM-
     specific coupling. X-features are prepared the same way training does
     (`pipeline.model.prepare_track1_features`), so train/inference can't drift.
 

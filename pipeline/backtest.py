@@ -31,6 +31,7 @@ from .marts import (
     build_mart1_training_set,
     mart1_split_windows,
 )
+from .model import CHRONIC_VISIT_PROB_CUTOFF
 
 # This module's own output columns.
 PREDICTED_COL = "예측수요"
@@ -92,7 +93,12 @@ class _BacktestDay(NamedTuple):
     per_date: pd.DataFrame
 
 
-def run_backtest(raw_visits: pd.DataFrame, model, test_dates=None) -> BacktestResult:
+def run_backtest(
+    raw_visits: pd.DataFrame,
+    model,
+    test_dates=None,
+    chronic_visit_prob_cutoff: float = CHRONIC_VISIT_PROB_CUTOFF,
+) -> BacktestResult:
     """Walks `run_daily_forecast(raw_visits, as_of_date, model)` forward one
     calendar day at a time across `test_dates`, comparing each day's
     pre-buffer combined demand (`track1_기댓값 + track2_통계값`) to actual
@@ -103,7 +109,10 @@ def run_backtest(raw_visits: pd.DataFrame, model, test_dates=None) -> BacktestRe
     `test_start` to `end`) -- production's own test window -- but is overridable for
     smaller/faster runs and tests. `model` is used as-is across every
     as-of-date; this function never trains or retrains it (see
-    `pipeline.model.train_track1_model`).
+    `pipeline.model.train_track1_model`), so its probabilities are whatever
+    `model.predict_proba` gives -- calibrated, for a `CalibratedTrack1Model`.
+    `chronic_visit_prob_cutoff` is forwarded to `run_daily_forecast`, e.g.
+    the cutoff training just tuned.
 
     Returns a `BacktestResult`:
 
@@ -133,7 +142,10 @@ def run_backtest(raw_visits: pd.DataFrame, model, test_dates=None) -> BacktestRe
     if test_dates is None:
         test_dates = _default_test_dates(raw_visits)
 
-    days = [_backtest_one_day(raw_visits, as_of_date, model) for as_of_date in test_dates]
+    days = [
+        _backtest_one_day(raw_visits, as_of_date, model, chronic_visit_prob_cutoff)
+        for as_of_date in test_dates
+    ]
     if days:
         daily = pd.concat([day.daily for day in days], ignore_index=True)
         per_date = pd.concat([day.per_date for day in days], ignore_index=True)
@@ -167,9 +179,13 @@ def _default_test_dates(raw_visits: pd.DataFrame) -> pd.DatetimeIndex:
     return pd.date_range(windows.test_start, windows.end, freq="D")
 
 
-def _backtest_one_day(raw_visits: pd.DataFrame, as_of_date, model) -> _BacktestDay:
+def _backtest_one_day(
+    raw_visits: pd.DataFrame, as_of_date, model, chronic_visit_prob_cutoff: float
+) -> _BacktestDay:
     as_of_date = pd.Timestamp(as_of_date)
-    forecast = run_daily_forecast(raw_visits, as_of_date, model)
+    forecast = run_daily_forecast(
+        raw_visits, as_of_date, model, chronic_visit_prob_cutoff=chronic_visit_prob_cutoff
+    )
     scored_customer_ids = set(forecast.scored_population[CUSTOMER_ID_COL])
     target_visits = _visits_on(raw_visits, as_of_date + pd.Timedelta(days=1))
 
