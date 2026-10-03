@@ -86,6 +86,8 @@ def test_returns_calibrated_model_metrics_and_cutoff_tuning():
         assert 0.0 <= value <= 1.0
     assert result.cutoff_tuning.cutoff is not None
     assert 0.0 < result.cutoff_tuning.f1 <= 1.0
+    # The tuned cutoff travels with the model it was tuned for.
+    assert result.model.chronic_visit_prob_cutoff == result.cutoff_tuning.cutoff
 
 
 def test_learns_the_synthetic_relationship_reasonably_well():
@@ -329,6 +331,7 @@ def test_model_persists_and_reloads_to_an_equivalent_usable_model(tmp_path):
     # The calibrator round-trips with the classifier: reloaded probabilities
     # are the calibrated ones, not the raw scores.
     assert reloaded.calibrator == result.model.calibrator
+    assert reloaded.chronic_visit_prob_cutoff == result.model.chronic_visit_prob_cutoff
     X_val = prepare_track1_features(val)
     original_proba = result.model.predict_proba(X_val)[:, 1]
     reloaded_proba = reloaded.predict_proba(X_val)[:, 1]

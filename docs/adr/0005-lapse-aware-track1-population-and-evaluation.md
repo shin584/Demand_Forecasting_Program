@@ -50,7 +50,7 @@ On v0.3, with the model retrained and scored on 2025-09-08, 33.9% of training ne
 The **cutoff is now tuned by maximising F1** instead of against those targets. Each training run picks the cutoff that maximises F1 against next-day Chronic visits on the calibrated validation snapshots, breaking ties towards the higher cutoff. This supersedes the "≥70% recall with a ≥20% precision floor" rule in *Calibration and cutoff* above.
 
 - On v0.3 the chosen cutoff is 0.108, with validation precision 17%, recall 35% and F1 0.23 (test F1 0.21), and ~71 customers a day on the Visit List. The previous 0.3 gave F1 0.12 with 7% recall.
-- `CHRONIC_VISIT_PROB_CUTOFF` (0.11) is only the fallback default wherever no freshly tuned cutoff is passed.
+- The tuned cutoff is saved with the model, alongside its calibrator (`CalibratedTrack1Model.chronic_visit_prob_cutoff`), and inference and the backtest default to it. `CHRONIC_VISIT_PROB_CUTOFF` (0.11) is only the fallback for a model that carries none.
 - Rejected:
   - *a fixed cutoff in the 0.10–0.12 band*: equivalent today, but it goes stale when retraining shifts the calibrated probabilities.
   - *F2*, which weights recall: cutoff 0.073, 48% recall, but ~126 customers a day for the pharmacist to review.

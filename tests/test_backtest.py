@@ -378,6 +378,19 @@ def test_scores_with_calibrated_probabilities():
     assert result.per_date.iloc[0][SUM_VISIT_PROB_COL] == pytest.approx(0.05)
 
 
+def test_per_date_visit_list_size_uses_the_models_tuned_cutoff_by_default():
+    raw_visits = make_raw_visits(_one_chronic_customer_on_drug_501())
+    model = CalibratedTrack1Model(
+        classifier=StubModel(0.2),
+        calibrator=PlattCalibrator(slope=1.0, intercept=0.0),
+        chronic_visit_prob_cutoff=0.15,
+    )
+
+    result = run_backtest(raw_visits, model, test_dates=["2024-01-14"])
+
+    assert result.per_date.iloc[0][VISIT_LIST_SIZE_COL] == 1
+
+
 def test_per_date_has_one_row_per_test_date():
     raw_visits = make_raw_visits(_one_chronic_customer_on_drug_501())
 

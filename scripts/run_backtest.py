@@ -7,11 +7,12 @@ Trains Track 1's model once on `split_mart1_training_set`'s train/val split
 cutoff-tuned on full daily validation snapshots (matching production's own
 training path, see `pipeline.model.train_track1_model`) -- reports the test
 window's Σp against actual Chronic next-day visits, then walks the trained
-model forward across the split's test window at the tuned (F1-maximising)
-cutoff, or the default `CHRONIC_VISIT_PROB_CUTOFF` if none could be tuned. A full run
-walks one calendar day at a time across the whole test window (6 months by
-default), rebuilding Mart 1/2/3 as of each day -- a few seconds per day on
-the v0.3 extract; pass a narrower `--test-dates-limit` while iterating.
+model forward across the split's test window at the cutoff it carries (the
+tuned, F1-maximising one, or the default `CHRONIC_VISIT_PROB_CUTOFF` if none
+could be tuned). A full run walks one calendar day at a time across the
+whole test window (6 months by default), rebuilding Mart 1/2/3 as of each
+day -- a few seconds per day on the v0.3 extract; pass a narrower
+`--test-dates-limit` while iterating.
 
 Usage: python scripts/run_backtest.py [--test-dates-limit N]
 """
@@ -160,9 +161,6 @@ def main() -> None:
     trained = train_track1_model(split.train, split.val, split.test)
     training_summary = _training_summary(trained)
     print(training_summary, end="")
-    cutoff = trained.cutoff_tuning.cutoff
-    if cutoff is None:
-        cutoff = CHRONIC_VISIT_PROB_CUTOFF
 
     test_dates = None
     if args.test_dates_limit is not None:
@@ -170,9 +168,7 @@ def main() -> None:
         full_range = pd.date_range(windows.test_start, windows.end, freq="D")
         test_dates = list(full_range[: args.test_dates_limit])
 
-    result = run_backtest(
-        raw_visits, trained.model, test_dates=test_dates, chronic_visit_prob_cutoff=cutoff
-    )
+    result = run_backtest(raw_visits, trained.model, test_dates=test_dates)
     _write_report(REPORT_PATH, result, training_summary)
 
     print(

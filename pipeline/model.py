@@ -37,9 +37,10 @@ from .marts import (
 # (see CONTEXT.md "Visit-Probability Calibration" and "Decision Thresholds
 # (provisional)"): gates the Visit List and the rare-drug allocation rule.
 # `train_track1_model` re-tunes it on each validation window by maximising
-# F1 (`tune_chronic_cutoff`); this is the default wherever no tuned cutoff is
-# passed -- the F1-maximising cutoff on the v0.3 extract (0.108, issue #32),
-# rounded.
+# F1 (`tune_chronic_cutoff`) and saves it with the model; this is only the
+# fallback for a model that carries no tuned cutoff (see
+# `resolve_chronic_cutoff`) -- the F1-maximising cutoff on the v0.3 extract
+# (0.108, issue #32), rounded.
 CHRONIC_VISIT_PROB_CUTOFF = 0.11
 
 # Raw scores are clipped this far from 0 and 1 before taking their logit, so
@@ -106,16 +107,21 @@ class PlattCalibrator:
 
 @dataclass(frozen=True)
 class CalibratedTrack1Model:
-    """Track 1's classifier with its Platt calibrator: what training returns,
-    what gets saved and loaded, and what inference and the backtest score
-    with. `predict_proba` gives calibrated probabilities, so every consumer
-    of a visit probability sees them without knowing calibration exists.
+    """Track 1's classifier with its Platt calibrator and the Chronic cutoff
+    tuned on the same validation probabilities: what training returns, what
+    gets saved and loaded, and what inference and the backtest score with.
+    `predict_proba` gives calibrated probabilities, so every consumer of a
+    visit probability sees them without knowing calibration exists, and
+    inference defaults to `chronic_visit_prob_cutoff` (see
+    `resolve_chronic_cutoff`).
 
     `classifier` is anything with a scikit-learn-shaped `predict_proba` --
-    the trained `LGBMClassifier` in production, a stub in tests."""
+    the trained `LGBMClassifier` in production, a stub in tests.
+    `chronic_visit_prob_cutoff` is None when training couldn't tune one."""
 
     classifier: object
     calibrator: PlattCalibrator
+    chronic_visit_prob_cutoff: float | None = None
 
     def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
         calibrated = self.calibrator.transform(self.classifier.predict_proba(X)[:, 1])
@@ -180,7 +186,8 @@ def train_track1_model(
 
     Returns a `TrainedTrack1Model`:
 
-    - `model`: the `CalibratedTrack1Model` (classifier + calibrator).
+    - `model`: the `CalibratedTrack1Model` (classifier, calibrator and
+      `cutoff_tuning`'s cutoff).
     - `metrics` on `val`: `auc`, `base_rate` (share of rows labelled
       내일_방문) and `mean_p` (mean calibrated probability, which should
       match `base_rate`).
@@ -204,10 +211,14 @@ def train_track1_model(
     )
 
     raw_val_proba = classifier.predict_proba(X_val)[:, 1]
+    calibrator = PlattCalibrator.fit(raw_val_proba, y_val)
+    val_proba = calibrator.transform(raw_val_proba)
+    cutoff_tuning = tune_chronic_cutoff(y_val, val_proba)
     model = CalibratedTrack1Model(
-        classifier=classifier, calibrator=PlattCalibrator.fit(raw_val_proba, y_val)
+        classifier=classifier,
+        calibrator=calibrator,
+        chronic_visit_prob_cutoff=cutoff_tuning.cutoff,
     )
-    val_proba = model.calibrator.transform(raw_val_proba)
     metrics = {
         "auc": roc_auc_score(y_val, val_proba),
         "base_rate": y_val.mean(),
@@ -216,9 +227,20 @@ def train_track1_model(
     return TrainedTrack1Model(
         model=model,
         metrics=metrics,
-        cutoff_tuning=tune_chronic_cutoff(y_val, val_proba),
+        cutoff_tuning=cutoff_tuning,
         sum_p_check=None if test is None else _sum_p_check(model, test),
     )
+
+
+def resolve_chronic_cutoff(model, chronic_visit_prob_cutoff: float | None = None) -> float:
+    """The Chronic cutoff to score `model` at: `chronic_visit_prob_cutoff` if
+    given, else the model's own tuned cutoff (`CalibratedTrack1Model
+    .chronic_visit_prob_cutoff`), else `CHRONIC_VISIT_PROB_CUTOFF` -- for a
+    model that carries none, e.g. an untuned one or a test stub."""
+    if chronic_visit_prob_cutoff is not None:
+        return chronic_visit_prob_cutoff
+    tuned = getattr(model, "chronic_visit_prob_cutoff", None)
+    return CHRONIC_VISIT_PROB_CUTOFF if tuned is None else tuned
 
 
 def tune_chronic_cutoff(y, proba) -> CutoffTuning:

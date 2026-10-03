@@ -496,6 +496,59 @@ def test_default_cutoff_matches_chronic_visit_prob_cutoff():
     assert list(result.visit_list[CUSTOMER_ID_COL]) == [2]
 
 
+def _identity_calibrated(probabilities: list[float], cutoff: float | None) -> CalibratedTrack1Model:
+    """`StubModel(probabilities)` behind an identity calibrator (slope 1,
+    intercept 0), carrying `cutoff` as its tuned Chronic cutoff."""
+    return CalibratedTrack1Model(
+        classifier=StubModel(probabilities),
+        calibrator=PlattCalibrator(slope=1.0, intercept=0.0),
+        chronic_visit_prob_cutoff=cutoff,
+    )
+
+
+def test_default_cutoff_is_the_models_own_tuned_cutoff():
+    raw_visits = _two_chronic_customers_with_drug_consumption(
+        "2024-01-01", drug_id=501, consumption_1=40.0, consumption_2=20.0
+    )
+    model = _identity_calibrated([0.5, 0.7], cutoff=0.6)
+
+    track1 = run_track1_inference(raw_visits, as_of_date="2024-01-01", model=model)
+    forecast = run_daily_forecast(raw_visits, as_of_date="2024-01-01", model=model)
+
+    assert list(track1.visit_list[CUSTOMER_ID_COL]) == [2]
+    assert list(forecast.visit_list[CUSTOMER_ID_COL]) == [2]
+
+
+def test_explicit_cutoff_overrides_the_models_tuned_cutoff():
+    raw_visits = _two_chronic_customers_with_drug_consumption(
+        "2024-01-01", drug_id=501, consumption_1=40.0, consumption_2=20.0
+    )
+    model = _identity_calibrated([0.5, 0.7], cutoff=0.6)
+
+    result = run_track1_inference(
+        raw_visits, as_of_date="2024-01-01", model=model, chronic_visit_prob_cutoff=0.4
+    )
+
+    assert sorted(result.visit_list[CUSTOMER_ID_COL]) == [1, 2]
+
+
+def test_model_without_a_tuned_cutoff_falls_back_to_the_default():
+    from pipeline.model import CHRONIC_VISIT_PROB_CUTOFF
+
+    raw_visits = _two_chronic_customers_with_drug_consumption(
+        "2024-01-01", drug_id=501, consumption_1=40.0, consumption_2=20.0
+    )
+    # Just above rather than exactly at the cutoff: the identity calibrator's
+    # logit/sigmoid round trip can land a hair below an exact value.
+    model = _identity_calibrated(
+        [CHRONIC_VISIT_PROB_CUTOFF - 0.01, CHRONIC_VISIT_PROB_CUTOFF + 0.001], cutoff=None
+    )
+
+    result = run_track1_inference(raw_visits, as_of_date="2024-01-01", model=model)
+
+    assert list(result.visit_list[CUSTOMER_ID_COL]) == [2]
+
+
 # --- run_daily_forecast: combines Track 1's drug demand with Track 2's Mart
 # 3 lookup into the final order-quantity table (issue #21). ---
 

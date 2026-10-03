@@ -31,7 +31,6 @@ from .marts import (
     build_mart1_training_set,
     mart1_split_windows,
 )
-from .model import CHRONIC_VISIT_PROB_CUTOFF
 
 # This module's own output columns.
 PREDICTED_COL = "예측수요"
@@ -97,7 +96,7 @@ def run_backtest(
     raw_visits: pd.DataFrame,
     model,
     test_dates=None,
-    chronic_visit_prob_cutoff: float = CHRONIC_VISIT_PROB_CUTOFF,
+    chronic_visit_prob_cutoff: float | None = None,
 ) -> BacktestResult:
     """Walks `run_daily_forecast(raw_visits, as_of_date, model)` forward one
     calendar day at a time across `test_dates`, comparing each day's
@@ -111,8 +110,8 @@ def run_backtest(
     as-of-date; this function never trains or retrains it (see
     `pipeline.model.train_track1_model`), so its probabilities are whatever
     `model.predict_proba` gives -- calibrated, for a `CalibratedTrack1Model`.
-    `chronic_visit_prob_cutoff` is forwarded to `run_daily_forecast`, e.g.
-    the cutoff training just tuned.
+    `chronic_visit_prob_cutoff` is forwarded to `run_daily_forecast`; left
+    unset, that uses the model's own tuned cutoff.
 
     Returns a `BacktestResult`:
 
@@ -180,7 +179,7 @@ def _default_test_dates(raw_visits: pd.DataFrame) -> pd.DatetimeIndex:
 
 
 def _backtest_one_day(
-    raw_visits: pd.DataFrame, as_of_date, model, chronic_visit_prob_cutoff: float
+    raw_visits: pd.DataFrame, as_of_date, model, chronic_visit_prob_cutoff: float | None
 ) -> _BacktestDay:
     as_of_date = pd.Timestamp(as_of_date)
     forecast = run_daily_forecast(
