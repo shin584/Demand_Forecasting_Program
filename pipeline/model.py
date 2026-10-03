@@ -36,18 +36,11 @@ from .marts import (
 # Track 1's Chronic visit-probability cutoff on *calibrated* probabilities
 # (see CONTEXT.md "Visit-Probability Calibration" and "Decision Thresholds
 # (provisional)"): gates the Visit List and the rare-drug allocation rule.
-# `train_track1_model` re-tunes it on each validation window
-# (`tune_chronic_cutoff`); this is the default wherever no tuned cutoff is
-# passed. Still the untuned placeholder: on the v0.3 extract no cutoff meets
-# both tuning targets below (issue #32).
-CHRONIC_VISIT_PROB_CUTOFF = 0.3
-
-# The provisional targets `tune_chronic_cutoff` tunes the cutoff against (see
-# CONTEXT.md "Decision Thresholds (provisional)"): the cutoff must catch at
-# least this share of next-day Chronic visits, at no worse than this
-# precision.
-CHRONIC_CUTOFF_MIN_RECALL = 0.70
-CHRONIC_CUTOFF_MIN_PRECISION = 0.20
+# `train_track1_model` re-tunes it on each validation window by maximising
+# F1 (`tune_chronic_cutoff`); this is the default wherever no tuned cutoff is
+# passed -- the F1-maximising cutoff on the v0.3 extract (0.108, issue #32),
+# rounded.
+CHRONIC_VISIT_PROB_CUTOFF = 0.11
 
 # Raw scores are clipped this far from 0 and 1 before taking their logit, so
 # a saturated LightGBM score can't become an infinite Platt input.
@@ -131,14 +124,13 @@ class CalibratedTrack1Model:
 
 class CutoffTuning(NamedTuple):
     """`tune_chronic_cutoff`'s result: the chosen cutoff and the validation
-    precision/recall at it -- all None/NaN when no cutoff met both targets --
-    plus the targets it was tuned against."""
+    precision, recall and F1 at it -- None/NaN when validation has no
+    Next-Day Visits to tune against."""
 
     cutoff: float | None
     precision: float
     recall: float
-    min_recall: float
-    min_precision: float
+    f1: float
 
 
 class SumPCheck(NamedTuple):
@@ -168,8 +160,6 @@ def train_track1_model(
     train: pd.DataFrame,
     val: pd.DataFrame,
     test: pd.DataFrame | None = None,
-    min_recall: float = CHRONIC_CUTOFF_MIN_RECALL,
-    min_precision: float = CHRONIC_CUTOFF_MIN_PRECISION,
 ) -> TrainedTrack1Model:
     """Trains Track 1's LightGBM visit-probability classifier on `train`,
     early-stopped against `val`'s logloss (never `train`'s -- `val` is the
@@ -194,8 +184,8 @@ def train_track1_model(
     - `metrics` on `val`: `auc`, `base_rate` (share of rows labelled
       내일_방문) and `mean_p` (mean calibrated probability, which should
       match `base_rate`).
-    - `cutoff_tuning`: `tune_chronic_cutoff` on the calibrated `val`
-      probabilities, against `min_recall`/`min_precision`.
+    - `cutoff_tuning`: `tune_chronic_cutoff` (the F1-maximising cutoff) on
+      the calibrated `val` probabilities.
     - `sum_p_check`: `test`'s Σp against its actual next-day visits, or None
       when no `test` is given. `test` is never used for fitting.
     """
@@ -226,55 +216,46 @@ def train_track1_model(
     return TrainedTrack1Model(
         model=model,
         metrics=metrics,
-        cutoff_tuning=tune_chronic_cutoff(y_val, val_proba, min_recall, min_precision),
+        cutoff_tuning=tune_chronic_cutoff(y_val, val_proba),
         sum_p_check=None if test is None else _sum_p_check(model, test),
     )
 
 
-def tune_chronic_cutoff(
-    y,
-    proba,
-    min_recall: float = CHRONIC_CUTOFF_MIN_RECALL,
-    min_precision: float = CHRONIC_CUTOFF_MIN_PRECISION,
-) -> CutoffTuning:
-    """The highest cutoff (a customer is predicted to visit when `proba >=
-    cutoff`, as the Visit List does) that still catches `min_recall` of the
-    actual Next-Day Visits in `y`, provided precision there is at least
-    `min_precision` -- the smallest Visit List that meets both targets.
+def tune_chronic_cutoff(y, proba) -> CutoffTuning:
+    """The cutoff (a customer is predicted to visit when `proba >= cutoff`,
+    as the Visit List does) that maximises F1 against the actual Next-Day
+    Visits in `y` -- precision and recall weighted equally (see CONTEXT.md
+    "Decision Thresholds (provisional)"). Among cutoffs tied on F1, the
+    highest wins: the shortest Visit List for the same F1.
 
-    When no cutoff meets both, warns and returns `cutoff=None` (precision and
-    recall NaN) rather than silently choosing one.
+    When `y` has no Next-Day Visits there is nothing to tune against: warns
+    and returns `cutoff=None` (precision, recall and F1 NaN) rather than
+    silently choosing one.
     """
     y = np.asarray(y, dtype=bool)
-    if y.any():
-        precision, recall, thresholds = precision_recall_curve(y, proba)
-        # The curve's last point (precision 1, recall 0) has no threshold.
-        meets_targets = (recall[:-1] >= min_recall) & (precision[:-1] >= min_precision)
-    else:
-        meets_targets = np.zeros(0, dtype=bool)
-
-    if not meets_targets.any():
+    if not y.any():
         warnings.warn(
-            f"No Chronic cutoff reaches {min_recall:.0%} recall with at least "
-            f"{min_precision:.0%} precision on the validation probabilities.",
+            "No Chronic cutoff can be tuned: the validation probabilities have "
+            "no Next-Day Visits to tune against.",
             stacklevel=2,
         )
-        return CutoffTuning(
-            cutoff=None,
-            precision=float("nan"),
-            recall=float("nan"),
-            min_recall=min_recall,
-            min_precision=min_precision,
-        )
+        nan = float("nan")
+        return CutoffTuning(cutoff=None, precision=nan, recall=nan, f1=nan)
 
-    # Thresholds ascend, so the last feasible one is the highest.
-    best = np.flatnonzero(meets_targets)[-1]
+    precision, recall, thresholds = precision_recall_curve(y, proba)
+    # The curve's last point (precision 1, recall 0) has no threshold.
+    precision, recall = precision[:-1], recall[:-1]
+    denominator = precision + recall
+    f1 = np.divide(
+        2 * precision * recall, denominator, out=np.zeros_like(denominator), where=denominator > 0
+    )
+    # Thresholds ascend, so the last F1-maximising index is the highest cutoff.
+    best = np.flatnonzero(np.isclose(f1, f1.max()))[-1]
     return CutoffTuning(
         cutoff=float(thresholds[best]),
         precision=float(precision[best]),
         recall=float(recall[best]),
-        min_recall=min_recall,
-        min_precision=min_precision,
+        f1=float(f1[best]),
     )
 
 

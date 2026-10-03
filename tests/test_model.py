@@ -23,8 +23,6 @@ from pipeline.marts import (
     WEIGHT_COL,
 )
 from pipeline.model import (
-    CHRONIC_CUTOFF_MIN_PRECISION,
-    CHRONIC_CUTOFF_MIN_RECALL,
     CalibratedTrack1Model,
     PlattCalibrator,
     load_track1_model,
@@ -86,8 +84,8 @@ def test_returns_calibrated_model_metrics_and_cutoff_tuning():
     assert set(result.metrics) == {"auc", "base_rate", "mean_p"}
     for value in result.metrics.values():
         assert 0.0 <= value <= 1.0
-    assert result.cutoff_tuning.min_recall == CHRONIC_CUTOFF_MIN_RECALL
-    assert result.cutoff_tuning.min_precision == CHRONIC_CUTOFF_MIN_PRECISION
+    assert result.cutoff_tuning.cutoff is not None
+    assert 0.0 < result.cutoff_tuning.f1 <= 1.0
 
 
 def test_learns_the_synthetic_relationship_reasonably_well():
@@ -198,31 +196,38 @@ _TUNING_PROBA = np.array([0.9] * 5 + [0.8] * 2 + [0.6] * 3 + [0.4] * 3 + [0.1] *
 _TUNING_Y = np.array([True] * 7 + [False] * 3 + [True] * 3 + [False] * 7)
 
 
-def test_tune_cutoff_picks_the_highest_cutoff_reaching_the_recall_target():
-    tuning = tune_chronic_cutoff(_TUNING_Y, _TUNING_PROBA, min_recall=0.7, min_precision=0.2)
-
-    assert tuning.cutoff == pytest.approx(0.8)
-    assert tuning.recall == pytest.approx(0.7)
-    assert tuning.precision == pytest.approx(1.0)
-
-
-def test_tune_cutoff_targets_are_overridable():
-    tuning = tune_chronic_cutoff(_TUNING_Y, _TUNING_PROBA, min_recall=0.9, min_precision=0.2)
+def test_tune_cutoff_picks_the_f1_maximising_cutoff():
+    # F1 per cutoff: 0.9 -> 0.667, 0.8 -> 0.824, 0.6 -> 0.7, 0.4 -> 0.870,
+    # 0.1 -> 0.667.
+    tuning = tune_chronic_cutoff(_TUNING_Y, _TUNING_PROBA)
 
     assert tuning.cutoff == pytest.approx(0.4)
     assert tuning.recall == pytest.approx(1.0)
     assert tuning.precision == pytest.approx(10 / 13)
-    assert tuning.min_recall == 0.9
-    assert tuning.min_precision == 0.2
+    assert tuning.f1 == pytest.approx(2 * (10 / 13) / (1 + 10 / 13))
 
 
-def test_tune_cutoff_reports_clearly_when_no_cutoff_meets_both_targets():
-    # Reaching 90% recall needs cutoff 0.4 at best, where precision is 10/13.
+def test_tune_cutoff_breaks_f1_ties_towards_the_higher_cutoff():
+    # Cutoff 0.9 (precision 1, recall 1/2) and 0.3 (precision 1/2, recall 1)
+    # both reach F1 2/3; the higher one gives the shorter Visit List.
+    y = np.array([True, False, False, True])
+    proba = np.array([0.9, 0.6, 0.3, 0.3])
+
+    tuning = tune_chronic_cutoff(y, proba)
+
+    assert tuning.cutoff == pytest.approx(0.9)
+    assert tuning.f1 == pytest.approx(2 / 3)
+
+
+def test_tune_cutoff_reports_clearly_when_validation_has_no_visits():
+    y = np.zeros(5, dtype=bool)
+    proba = np.linspace(0.1, 0.5, 5)
+
     with pytest.warns(UserWarning, match="No Chronic cutoff"):
-        tuning = tune_chronic_cutoff(_TUNING_Y, _TUNING_PROBA, min_recall=0.9, min_precision=0.8)
+        tuning = tune_chronic_cutoff(y, proba)
 
     assert tuning.cutoff is None
-    assert np.isnan(tuning.precision) and np.isnan(tuning.recall)
+    assert np.isnan(tuning.precision) and np.isnan(tuning.recall) and np.isnan(tuning.f1)
 
 
 def test_training_reports_test_window_sum_of_probabilities_against_actual_visits():

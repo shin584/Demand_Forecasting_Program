@@ -7,8 +7,8 @@ Trains Track 1's model once on `split_mart1_training_set`'s train/val split
 cutoff-tuned on full daily validation snapshots (matching production's own
 training path, see `pipeline.model.train_track1_model`) -- reports the test
 window's Σp against actual Chronic next-day visits, then walks the trained
-model forward across the split's test window at the tuned cutoff (the
-provisional `CHRONIC_VISIT_PROB_CUTOFF` if tuning found none). A full run
+model forward across the split's test window at the tuned (F1-maximising)
+cutoff, or the default `CHRONIC_VISIT_PROB_CUTOFF` if none could be tuned. A full run
 walks one calendar day at a time across the whole test window (6 months by
 default), rebuilding Mart 1/2/3 as of each day -- a few seconds per day on
 the v0.3 extract; pass a narrower `--test-dates-limit` while iterating.
@@ -90,16 +90,15 @@ def _visit_probability_table(per_date: pd.DataFrame) -> pd.DataFrame:
 
 def _training_summary(trained) -> str:
     tuning = trained.cutoff_tuning
-    targets = f"≥{tuning.min_recall:.0%} recall, ≥{tuning.min_precision:.0%} precision"
     if tuning.cutoff is None:
         cutoff_line = (
-            f"Chronic cutoff: none on validation meets {targets}; "
+            "Chronic cutoff: none tuned (no validation Next-Day Visits); "
             f"falling back to the provisional {CHRONIC_VISIT_PROB_CUTOFF}"
         )
     else:
         cutoff_line = (
-            f"Chronic cutoff: {tuning.cutoff:.4f} ({targets}) -- validation "
-            f"precision {tuning.precision:.4f}, recall {tuning.recall:.4f}"
+            f"Chronic cutoff: {tuning.cutoff:.4f} (max F1) -- validation precision "
+            f"{tuning.precision:.4f}, recall {tuning.recall:.4f}, F1 {tuning.f1:.4f}"
         )
     metrics = ", ".join(f"{name} {value:.4f}" for name, value in trained.metrics.items())
     check = trained.sum_p_check
