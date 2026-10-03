@@ -3,8 +3,9 @@ extract and writes the headline WAPE plus a per-drug breakdown to a report
 file (see issue #18 and `pipeline.backtest.run_backtest`).
 
 Trains Track 1's model once on `split_mart1_training_set`'s train/val split
+-- sampled train rows, early-stopped against full daily validation snapshots
 (matching production's own training path, see `pipeline.model
-.train_track1_model`), then walks the trained model forward across the
+.train_track1_model`) -- then walks the trained model forward across the
 split's test window. A full run walks one calendar day at a time across the
 whole test window (6 months by default), rebuilding Mart 1/2/3 as of each
 day -- a few seconds per day on the v0.3 extract; pass a narrower
@@ -17,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -37,6 +39,7 @@ from pipeline.marts import (
     DRUG_ID_COL,
     SNAPSHOT_DATE_COL,
     build_mart1_training_set,
+    mart1_split_windows,
     split_mart1_training_set,
 )
 from pipeline.model import train_track1_model
@@ -123,14 +126,19 @@ def main() -> None:
     raw_visits = _load_raw_visits(RAW_DATA_PATH)
 
     training_set = build_mart1_training_set(raw_visits)
-    split = split_mart1_training_set(training_set)
+    started = time.perf_counter()
+    split = split_mart1_training_set(training_set, raw_visits)
+    print(
+        f"Built val/test daily snapshots in {time.perf_counter() - started:.1f}s "
+        f"({len(split.val):,} val rows, {len(split.test):,} test rows)"
+    )
     trained = train_track1_model(split.train, split.val)
     print(f"Trained Track 1 model -- val metrics: {trained.metrics}")
 
     test_dates = None
     if args.test_dates_limit is not None:
-        test = split.test[SNAPSHOT_DATE_COL]
-        full_range = pd.date_range(test.min(), test.max(), freq="D")
+        windows = mart1_split_windows(training_set)
+        full_range = pd.date_range(windows.test_start, windows.end, freq="D")
         test_dates = list(full_range[: args.test_dates_limit])
 
     result = run_backtest(raw_visits, trained.model, test_dates=test_dates)

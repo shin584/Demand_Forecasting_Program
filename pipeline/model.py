@@ -88,8 +88,9 @@ def train_track1_model(
     are passed to LightGBM as native pandas `category` dtype.
 
     Returns a `TrainedTrack1Model` with the fitted classifier and a metrics
-    dict (`auc`, `precision`, `recall`) computed on `val` -- precision/recall
-    at `cutoff` (default `CHRONIC_VISIT_PROB_CUTOFF`).
+    dict (`auc`, `base_rate`, `precision`, `recall`) computed on `val` --
+    `base_rate` is the share of `val` rows labelled 내일_방문, and
+    precision/recall are at `cutoff` (default `CHRONIC_VISIT_PROB_CUTOFF`).
     """
     X_train, y_train, weight_train = _features_target_weight(train)
     X_val, y_val, _ = _features_target_weight(val)
@@ -109,6 +110,7 @@ def train_track1_model(
     val_pred = val_proba >= cutoff
     metrics = {
         "auc": roc_auc_score(y_val, val_proba),
+        "base_rate": y_val.mean(),
         "precision": precision_score(y_val, val_pred, zero_division=0),
         "recall": recall_score(y_val, val_pred, zero_division=0),
     }

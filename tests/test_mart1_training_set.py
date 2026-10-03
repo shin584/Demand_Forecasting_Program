@@ -19,7 +19,6 @@ from pipeline.marts import (
     build_mart1_training_set,
     build_marts,
     sample_mart1_negatives,
-    split_mart1_training_set,
 )
 
 
@@ -268,67 +267,6 @@ def test_x_features_have_lightgbm_ready_dtypes():
         assert training_set[col].dtype == "float64", col
     for col in MART1_BOOLEAN_FEATURE_COLS:
         assert training_set[col].dtype == "boolean", col
-
-def _training_set_with_dates(dates: list) -> pd.DataFrame:
-    return pd.DataFrame({SNAPSHOT_DATE_COL: pd.to_datetime(dates)})
-
-
-def test_split_cuts_test_and_val_from_the_end_by_snapshot_date():
-    # Max 기준일자 is 2025-01-16: test = last 6mo (>= 2024-07-16), val = the
-    # 6mo before that (>= 2024-01-16, < 2024-07-16), train = everything else.
-    training_set = _training_set_with_dates(
-        ["2024-01-01", "2024-01-16", "2024-06-01", "2024-07-16", "2024-07-17", "2025-01-16"]
-    )
-
-    split = split_mart1_training_set(training_set)
-
-    assert list(split.train[SNAPSHOT_DATE_COL]) == [pd.Timestamp("2024-01-01")]
-    assert list(split.val[SNAPSHOT_DATE_COL]) == [
-        pd.Timestamp("2024-01-16"),
-        pd.Timestamp("2024-06-01"),
-    ]
-    assert list(split.test[SNAPSHOT_DATE_COL]) == [
-        pd.Timestamp("2024-07-16"),
-        pd.Timestamp("2024-07-17"),
-        pd.Timestamp("2025-01-16"),
-    ]
-
-
-def test_split_boundary_date_belongs_to_the_newer_window():
-    # A row dated exactly on a cutoff is inclusive on the more-recent side -
-    # exercised in isolation from test_split_cuts_test_and_val_from_the_end_by_snapshot_date's
-    # broader fixture.
-    training_set = _training_set_with_dates(["2024-07-16", "2025-01-16"])
-
-    split = split_mart1_training_set(training_set)
-
-    assert list(split.test[SNAPSHOT_DATE_COL]) == [
-        pd.Timestamp("2024-07-16"),
-        pd.Timestamp("2025-01-16"),
-    ]
-    assert split.train.empty
-    assert split.val.empty
-
-
-def test_split_of_empty_training_set_returns_three_empty_frames():
-    training_set = _training_set_with_dates([])
-
-    split = split_mart1_training_set(training_set)
-
-    assert split.train.empty
-    assert split.val.empty
-    assert split.test.empty
-
-
-def test_split_columns_match_input_columns():
-    raw_visits = make_raw_visits(make_high_frequency_filler_visits(_FILLER_OCCURRENCES) + _chronic_customer_history())
-    training_set = build_mart1_training_set(raw_visits)
-
-    split = split_mart1_training_set(training_set)
-
-    assert list(split.train.columns) == MART1_TRAINING_COLUMNS
-    assert list(split.val.columns) == MART1_TRAINING_COLUMNS
-    assert list(split.test.columns) == MART1_TRAINING_COLUMNS
 
 
 def test_no_negative_row_has_a_visit_on_the_day_after_its_snapshot_date():

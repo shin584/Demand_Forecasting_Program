@@ -28,7 +28,7 @@ from pipeline.marts import (
     DRUG_ID_COL,
     SNAPSHOT_DATE_COL,
     build_mart1_training_set,
-    split_mart1_training_set,
+    mart1_split_windows,
 )
 
 
@@ -209,23 +209,19 @@ def test_daily_columns():
     assert list(result.daily.columns) == BACKTEST_DAILY_COLUMNS
 
 
-def test_default_test_dates_matches_split_mart1_training_sets_test_window():
+def test_default_test_dates_matches_the_temporal_splits_test_window():
     # Leaving test_dates unset must walk forward across exactly the same
-    # dates as explicitly passing split_mart1_training_set's own test
-    # window range -- checked by running both and comparing output, since a
-    # day with nothing to predict or observe drops out of `daily` entirely
-    # either way (see `_backtest_one_day`), so the two runs' `daily` frames
-    # are only guaranteed identical, not a fixed date count.
+    # dates as explicitly passing mart1_split_windows' own test window --
+    # checked by running both and comparing output, since a day with nothing
+    # to predict or observe drops out of `daily` entirely either way (see
+    # `_backtest_one_day`), so the two runs' `daily` frames are only
+    # guaranteed identical, not a fixed date count.
     raw_visits = _one_chronic_customer_visiting_daily(
         drug_id=501, consumptions={"2024-01-15": 40.0, "2024-01-16": 30.0}
     )
     model = StubModel(0.5)
-    expected_test = split_mart1_training_set(build_mart1_training_set(raw_visits)).test
-    expected_dates = list(
-        pd.date_range(
-            expected_test[SNAPSHOT_DATE_COL].min(), expected_test[SNAPSHOT_DATE_COL].max()
-        )
-    )
+    windows = mart1_split_windows(build_mart1_training_set(raw_visits))
+    expected_dates = list(pd.date_range(windows.test_start, windows.end))
 
     default_result = run_backtest(raw_visits, model, test_dates=None)
     explicit_result = run_backtest(raw_visits, model, test_dates=expected_dates)

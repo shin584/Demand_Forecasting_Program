@@ -77,7 +77,7 @@ def test_returns_model_and_metrics_with_expected_keys_in_range():
     result = train_track1_model(train, val)
 
     assert result.model is not None
-    assert set(result.metrics) == {"auc", "precision", "recall"}
+    assert set(result.metrics) == {"auc", "base_rate", "precision", "recall"}
     for value in result.metrics.values():
         assert 0.0 <= value <= 1.0
 

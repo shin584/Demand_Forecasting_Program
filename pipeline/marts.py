@@ -21,7 +21,8 @@ docs/adr/0003-mart3-population-and-backoff-thresholds.md),
 set (Next-Day Visit positives plus early/mid/late negative samples, see that
 function) as a separate path from `build_marts`'s own single as_of_date
 snapshot, and `split_mart1_training_set`'s train/validation/test temporal
-split of that training set.
+split -- sampled train rows from that training set, full daily
+`build_mart1_daily_snapshots` for validation and test.
 """
 
 from __future__ import annotations
@@ -255,6 +256,12 @@ TEST_WINDOW_MONTHS = 6
 VAL_WINDOW_MONTHS = 6
 
 
+class Mart1SplitWindows(NamedTuple):
+    val_start: pd.Timestamp
+    test_start: pd.Timestamp
+    end: pd.Timestamp
+
+
 class MartResult(NamedTuple):
     mart1: pd.DataFrame
     mart2: pd.DataFrame
@@ -395,35 +402,133 @@ def build_mart1_training_set(
     return result[MART1_TRAINING_COLUMNS]
 
 
-def split_mart1_training_set(
+def mart1_split_windows(
     training_set: pd.DataFrame,
     test_months: int = TEST_WINDOW_MONTHS,
     val_months: int = VAL_WINDOW_MONTHS,
-) -> Mart1Split:
-    """Splits `build_mart1_training_set`'s output into train/val/test by
-    기준일자 (see docs/Plan.md "시계열 분할"): the most recent `test_months`
-    become test, the `val_months` immediately before that become validation,
-    and everything earlier becomes train.
+) -> Mart1SplitWindows:
+    """The Temporal Split's window boundaries (see docs/Plan.md "시계열 분할"
+    and `split_mart1_training_set`): test is the most recent `test_months`
+    up to `training_set`'s max 기준일자 (`end`, inclusive), validation the
+    `val_months` immediately before that, and train everything earlier.
 
-    Both window boundaries are computed from `training_set`'s own max 기준일자
-    -- never a hardcoded calendar date -- so test and val always land on the
+    Both boundaries are computed from `training_set`'s own max 기준일자 --
+    never a hardcoded calendar date -- so test and val always land on the
     same two fixed-size, most-recent windows regardless of how much history
     `training_set` covers; train simply absorbs whatever's left before them.
     This is "cut from the end, unrounded": the two eval windows are protected
     at their planned size, and train isn't padded or trimmed to hit a target
-    proportion.
-
-    Each boundary is inclusive on its more-recent side: a row dated exactly
-    on a cutoff belongs to the newer of the two windows it separates.
+    proportion. Each boundary is inclusive on its more-recent side: a date
+    exactly on a cutoff belongs to the newer of the two windows it separates.
+    All three are NaT for an empty `training_set`.
     """
-    snapshot_dates = training_set[SNAPSHOT_DATE_COL]
-    test_start = snapshot_dates.max() - pd.DateOffset(months=test_months)
+    if training_set.empty:
+        return Mart1SplitWindows(val_start=pd.NaT, test_start=pd.NaT, end=pd.NaT)
+    end = training_set[SNAPSHOT_DATE_COL].max()
+    test_start = end - pd.DateOffset(months=test_months)
     val_start = test_start - pd.DateOffset(months=val_months)
+    return Mart1SplitWindows(val_start=val_start, test_start=test_start, end=end)
 
-    train = training_set[snapshot_dates < val_start]
-    val = training_set[(snapshot_dates >= val_start) & (snapshot_dates < test_start)]
-    test = training_set[snapshot_dates >= test_start]
+
+def split_mart1_training_set(
+    training_set: pd.DataFrame,
+    raw_visits: pd.DataFrame,
+    test_months: int = TEST_WINDOW_MONTHS,
+    val_months: int = VAL_WINDOW_MONTHS,
+    lapse_horizon_days: int = LAPSE_HORIZON_DAYS,
+) -> Mart1Split:
+    """Splits Mart 1 into train/val/test over `mart1_split_windows`'s
+    windows. Only train is drawn from `training_set`
+    (`build_mart1_training_set`'s sampled rows, dated before the validation
+    window). Validation and test are full daily snapshots of `raw_visits`
+    (`build_mart1_daily_snapshots`, with `lapse_horizon_days`): every
+    non-Lapsed Chronic customer on every day of the window, exactly the
+    population and base rate Track 1 meets at inference, so early stopping
+    and evaluation can't be flattered by the sampling scheme (see
+    docs/adr/0005-lapse-aware-track1-population-and-evaluation.md,
+    "Evaluation on the inference distribution").
+
+    `raw_visits` must be the extract `training_set` was built from. All
+    three parts come back empty for an empty `training_set`.
+    """
+    windows = mart1_split_windows(training_set, test_months, val_months)
+    if pd.isna(windows.end):
+        empty = pd.DataFrame(columns=MART1_TRAINING_COLUMNS)
+        return Mart1Split(train=empty, val=empty.copy(), test=empty.copy())
+
+    train = training_set[training_set[SNAPSHOT_DATE_COL] < windows.val_start]
+    # One pass over both eval windows, sliced afterwards.
+    snapshots = build_mart1_daily_snapshots(
+        raw_visits, windows.val_start, windows.end, lapse_horizon_days
+    )
+    is_test = snapshots[SNAPSHOT_DATE_COL] >= windows.test_start
+    val = snapshots[~is_test].reset_index(drop=True)
+    test = snapshots[is_test].reset_index(drop=True)
     return Mart1Split(train=train, val=val, test=test)
+
+
+def build_mart1_daily_snapshots(
+    raw_visits: pd.DataFrame, start, end, lapse_horizon_days: int = LAPSE_HORIZON_DAYS
+) -> pd.DataFrame:
+    """Mart 1's full daily snapshots for every day from `start` to `end`
+    (inclusive): the rows `build_marts(raw_visits, day).mart1` would hold
+    for each day -- every non-Lapsed Chronic customer, with the same
+    X-features, real Next-Day Visit label and as-of 학습_가중치 -- each
+    tagged with its day as 기준일자 (`MART1_TRAINING_COLUMNS`), ordered by
+    기준일자 then 고객ID.
+
+    Built in one vectorized pass over every candidate (customer, day) pair
+    rather than one `build_marts` call per day: a customer is a candidate
+    from their Chronic-since Date (see `chronic_since_dates`) until
+    `lapse_horizon_days` after their last visit, and a gap inside that span
+    longer than the horizon is dropped by the same `_is_within_lapse_horizon`
+    check `build_marts` applies. Days on or after the extract's last 내방일
+    are left out, as in `build_mart1_training_set`, since their label falls
+    outside the data. Returns an empty `MART1_TRAINING_COLUMNS`-shaped
+    frame when no customer is in the population on any day.
+    """
+    start, end = pd.Timestamp(start), pd.Timestamp(end)
+    visit_dates = pd.to_datetime(raw_visits[VISIT_DATE_COL])
+    end = min(end, visit_dates.max() - pd.Timedelta(days=1))
+    chronic_since = chronic_since_dates(raw_visits)
+
+    last_visit = visit_dates.groupby(raw_visits[CUSTOMER_ID_COL]).max()
+    first_days = chronic_since.clip(lower=start)
+    last_days = (
+        last_visit.reindex(chronic_since.index) + pd.Timedelta(days=lapse_horizon_days)
+    ).clip(upper=end)
+    day_counts = np.maximum((last_days - first_days).dt.days.to_numpy() + 1, 0)
+    if day_counts.sum() == 0:
+        return pd.DataFrame(columns=MART1_TRAINING_COLUMNS)
+
+    # Each candidate customer repeated once per day, with day offsets
+    # counting up from 0 within each customer's run.
+    run_starts = np.repeat(np.cumsum(day_counts) - day_counts, day_counts)
+    offsets = np.arange(day_counts.sum()) - run_starts
+    rows = pd.DataFrame(
+        {
+            SNAPSHOT_DATE_COL: np.repeat(first_days.to_numpy(), day_counts)
+            + pd.to_timedelta(offsets, unit="D"),
+            CUSTOMER_ID_COL: np.repeat(chronic_since.index.to_numpy(), day_counts),
+        }
+    ).sort_values([SNAPSHOT_DATE_COL, CUSTOMER_ID_COL], kind="stable", ignore_index=True)
+
+    visited = pd.MultiIndex.from_arrays([raw_visits[CUSTOMER_ID_COL], visit_dates])
+    rows[NEXT_DAY_VISIT_COL] = pd.MultiIndex.from_arrays(
+        [rows[CUSTOMER_ID_COL], rows[SNAPSHOT_DATE_COL] + pd.Timedelta(days=1)]
+    ).isin(visited)
+    rows[CHRONIC_COL] = True
+    rows = rows.join(_mart1_x_features(raw_visits, rows[CUSTOMER_ID_COL], rows[SNAPSHOT_DATE_COL]))
+    rows = rows[_is_within_lapse_horizon(rows, lapse_horizon_days)].reset_index(drop=True)
+
+    # As-of-correct, as `build_marts` gives it (`sample_mart1_weights` over
+    # visits up to the day): every row is Chronic, so it's the chronic tier
+    # until the customer's first severity-flagged visit, the severity tier
+    # from then on.
+    severity_since = _severity_since_dates(raw_visits)
+    is_severe = rows[SNAPSHOT_DATE_COL] >= rows[CUSTOMER_ID_COL].map(severity_since)
+    rows[WEIGHT_COL] = np.where(is_severe, SEVERITY_TIER_WEIGHT, CHRONIC_TIER_WEIGHT)
+    return rows[MART1_TRAINING_COLUMNS]
 
 
 def revisit_match(raw_visits: pd.DataFrame) -> pd.Series:
@@ -687,10 +792,24 @@ def _severity_customer_ids(raw_visits: pd.DataFrame) -> set:
     CONTEXT.md "Severe/특례 Weight Tier")."""
     if raw_visits.empty:
         return set()
+    return set(raw_visits.loc[_severity_flag_mask(raw_visits), CUSTOMER_ID_COL])
+
+
+def _severity_flag_mask(raw_visits: pd.DataFrame) -> pd.Series:
+    """True for each raw row flagged by any `SEVERITY_FLAG_COLS` column."""
     mask = pd.Series(False, index=raw_visits.index)
     for col in SEVERITY_FLAG_COLS:
         mask = mask | _eligibility_flag_mask(raw_visits[col])
-    return set(raw_visits.loc[mask, CUSTOMER_ID_COL])
+    return mask
+
+
+def _severity_since_dates(raw_visits: pd.DataFrame) -> pd.Series:
+    """Per 고객ID, the 내방일 of their first visit flagged by any
+    `SEVERITY_FLAG_COLS` column -- the day they join the severity weight
+    tier as of-correctly (see `_severity_customer_ids`). Customers never
+    flagged have no entry."""
+    flagged = raw_visits[_severity_flag_mask(raw_visits)]
+    return pd.to_datetime(flagged[VISIT_DATE_COL]).groupby(flagged[CUSTOMER_ID_COL]).min()
 
 
 def _eligibility_flag_mask(column: pd.Series) -> pd.Series:

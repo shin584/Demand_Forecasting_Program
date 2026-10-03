@@ -29,7 +29,7 @@ from .marts import (
     SNAPSHOT_DATE_COL,
     VISIT_DATE_COL,
     build_mart1_training_set,
-    split_mart1_training_set,
+    mart1_split_windows,
 )
 
 # This module's own output columns.
@@ -98,9 +98,9 @@ def run_backtest(raw_visits: pd.DataFrame, model, test_dates=None) -> BacktestRe
     pre-buffer combined demand (`track1_기댓값 + track2_통계값`) to actual
     per-drug consumption on the target date (`as_of_date + 1 day`).
 
-    `test_dates` defaults to every calendar date (min to max, daily) in
-    `split_mart1_training_set(build_mart1_training_set(raw_visits)).test`'s
-    기준일자 range -- production's own test window -- but is overridable for
+    `test_dates` defaults to every calendar date of the Temporal Split's
+    test window (`mart1_split_windows(build_mart1_training_set(raw_visits))`,
+    `test_start` to `end`) -- production's own test window -- but is overridable for
     smaller/faster runs and tests. `model` is used as-is across every
     as-of-date; this function never trains or retrains it (see
     `pipeline.model.train_track1_model`).
@@ -161,11 +161,10 @@ def _empty_per_date() -> pd.DataFrame:
 
 
 def _default_test_dates(raw_visits: pd.DataFrame) -> pd.DatetimeIndex:
-    training_set = build_mart1_training_set(raw_visits)
-    test = split_mart1_training_set(training_set).test[SNAPSHOT_DATE_COL]
-    if test.empty:
+    windows = mart1_split_windows(build_mart1_training_set(raw_visits))
+    if pd.isna(windows.end):
         return pd.DatetimeIndex([])
-    return pd.date_range(test.min(), test.max(), freq="D")
+    return pd.date_range(windows.test_start, windows.end, freq="D")
 
 
 def _backtest_one_day(raw_visits: pd.DataFrame, as_of_date, model) -> _BacktestDay:
