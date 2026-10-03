@@ -1,0 +1,5 @@
+pandas
+pytest
+lightgbm
+scikit-learn
+joblib

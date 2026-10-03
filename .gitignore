@@ -1,0 +1,17 @@
+# Raw pharmacy extracts contain PII-adjacent data and must stay local-only
+# (see CONTEXT.md "PII Policy") — but the extraction script itself isn't data.
+/dataset/D/
+/dataset/*.csv
+/dataset/*.xlsx
+
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Trained Track 1 model artifact (see pipeline/model.py) -- a regenerable
+# build output, not source.
+/pipeline/artifacts/
+
+# Backtest report (see scripts/run_backtest.py) -- regenerable from the raw
+# extract, not source.
+/reports/
