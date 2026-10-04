@@ -2,8 +2,9 @@
 snapshot and produces the pharmacist Visit List plus Track 1's per-drug
 expected demand -- ordinary expected-value multiplication for most drugs,
 the Chronic-population rare-drug allocation override for the rest. Also
-combines that with Track 2's Mart 3 lookup into the final per-drug
-order-quantity table.
+combines that with Track 2's estimate -- Mart 3's season x weekday lookup,
+plus Track 2 Rare-Drug Allocation's stock floor for the rare Acute drugs Mart 3 leaves
+out -- into the final per-drug order-quantity table.
 
 See CONTEXT.md ("Visit List", "Safety Stock", "Track 1 Rare-Drug
 Allocation") and docs/adr/0004-track1-rare-drug-population-and-allocation.md
@@ -11,7 +12,7 @@ for the design this encodes. Issue #20 built `run_track1_inference`; issue
 #21 (this module's `run_daily_forecast`/`_combine_order_quantities`) added
 Track 2's lookup and the combined table on top of its output; issue #22
 added the Chronic-population rare-drug allocation override into
-`_track1_drug_demand`, completing `run_daily_forecast`'s final behavior.
+`_track1_drug_demand`; issue #37 added Track 2 Rare-Drug Allocation.
 """
 
 from __future__ import annotations
@@ -30,9 +31,11 @@ from .marts import (
     MART3_SEASON_MIN_DAYS,
     MART3_VALUE_COL,
     RARE_DRUG_PATIENT_THRESHOLD,
+    RARE_STOCK_FLOOR_COL,
     SEASON_COL,
     SNAPSHOT_DATE_COL,
     WEEKDAY_COL,
+    track2_rare_drug_allocation,
     build_marts,
     chronic_rare_drug_ids,
     current_regimen,
@@ -60,6 +63,7 @@ ORDER_QUANTITY_COLUMNS = [
     TRACK1_DEMAND_COL,
     TRACK2_STAT_COL,
     FINAL_ORDER_COL,
+    RARE_STOCK_FLOOR_COL,
 ]
 
 # Safety-stock buffer applied to the combined Track 1 + Track 2 subtotal (see
@@ -284,14 +288,16 @@ def run_daily_forecast(
     lapse_horizon_days: int = LAPSE_HORIZON_DAYS,
 ) -> ForecastResult:
     """The full daily forecast: Track 1's Visit List and per-drug demand
-    (`run_track1_inference`) combined with Track 2's Mart 3 lookup into the
-    final per-drug order-quantity table.
+    (`run_track1_inference`) combined with Track 2's estimate (Mart 3's
+    lookup plus `track2_rare_drug_allocation`) into the final per-drug
+    order-quantity table.
 
     `mart3_bucket_min_days`/`mart3_season_min_days` are
     forwarded to `build_marts` for Mart 3 only (see that function) -- they
-    don't affect Track 1's own Mart 1/Mart 2-based computation. `rare_drug_patient_threshold` is forwarded to both:
-    Mart 3's Acute-population rare-drug filter and Track 1's own
-    Chronic-population rare-drug allocation override (see CONTEXT.md
+    don't affect Track 1's own Mart 1/Mart 2-based computation. `rare_drug_patient_threshold` is forwarded to
+    Mart 3's Acute-population rare-drug filter, Track 2 Rare-Drug Allocation
+    (which covers the drugs that filter leaves out), and Track 1's
+    own Chronic-population rare-drug allocation override (see CONTEXT.md
     "Decision Thresholds (provisional)" and docs/adr/0004) -- one shared
     threshold *value*, applied independently to each track's own population.
     `lapse_horizon_days` is forwarded to `build_marts` and only narrows
@@ -300,10 +306,13 @@ def run_daily_forecast(
     in `run_track1_inference`.
 
     `order_quantities` (`ORDER_QUANTITY_COLUMNS`: 기준일자, 약품ID, 약품명,
-    track1_기댓값, track2_통계값, 최종발주량) is the union of every drug
-    appearing in Track 1's or Track 2's result, zero-filled on whichever side
-    is absent, with 최종발주량 = (track1_기댓값 + track2_통계값) x
-    `safety_stock_buffer` (see CONTEXT.md "Safety Stock"). `visit_list` and
+    track1_기댓값, track2_통계값, 최종발주량, 희귀약_최소재고) is the union of
+    every drug appearing in Track 1's or Track 2's result, zero-filled on
+    whichever side is absent, with 최종발주량 = (track1_기댓값 +
+    track2_통계값) x `safety_stock_buffer` (see CONTEXT.md "Safety Stock").
+    Rare Acute drugs (`track2_rare_drug_allocation`) get no daily demand
+    (track2_통계값 0) but a stock floor in 희귀약_최소재고 for the
+    pharmacist -- 0 for every other drug, and never part of 최종발주량. `visit_list` and
     `scored_population` are passed through from Track 1 unchanged.
     """
     as_of_date = pd.Timestamp(as_of_date)
@@ -327,8 +336,11 @@ def run_daily_forecast(
         resolve_chronic_cutoff(model, chronic_visit_prob_cutoff),
         rare_drug_patient_threshold,
     )
+    track2_rare_drugs = track2_rare_drug_allocation(
+        raw_visits, as_of_date, rare_drug_patient_threshold
+    )
     order_quantities = _combine_order_quantities(
-        track1.drug_demand, mart3, raw_visits, as_of_date, safety_stock_buffer
+        track1.drug_demand, mart3, track2_rare_drugs, raw_visits, as_of_date, safety_stock_buffer
     )
     return ForecastResult(
         order_quantities=order_quantities,
@@ -340,11 +352,12 @@ def run_daily_forecast(
 def _combine_order_quantities(
     track1_drug_demand: pd.DataFrame,
     mart3: pd.DataFrame,
+    track2_rare_drugs: pd.DataFrame,
     raw_visits: pd.DataFrame,
     as_of_date: pd.Timestamp,
     safety_stock_buffer: float,
 ) -> pd.DataFrame:
-    """Combines Track 1's per-drug demand with Track 2's Mart 3 lookup for
+    """Combines Track 1's per-drug demand with Track 2's estimate for
     the target date (`as_of_date + 1 day`) into `ORDER_QUANTITY_COLUMNS`.
 
     A zero-filled outer union on 약품ID: a drug missing from one track
@@ -352,13 +365,14 @@ def _combine_order_quantities(
     drug that either track has something to say about is silently omitted.
     """
     target_date = as_of_date + pd.Timedelta(days=1)
-    track2_drug_demand = _track2_drug_demand(mart3, target_date)
+    track2_drug_demand = _track2_drug_demand(mart3, track2_rare_drugs, target_date)
 
     combined = track1_drug_demand[[DRUG_ID_COL, TRACK1_DEMAND_COL]].merge(
         track2_drug_demand, on=DRUG_ID_COL, how="outer"
     )
     combined[TRACK1_DEMAND_COL] = combined[TRACK1_DEMAND_COL].fillna(0.0)
     combined[TRACK2_STAT_COL] = combined[TRACK2_STAT_COL].fillna(0.0)
+    combined[RARE_STOCK_FLOOR_COL] = combined[RARE_STOCK_FLOOR_COL].fillna(0.0)
     combined[FINAL_ORDER_COL] = (
         combined[TRACK1_DEMAND_COL] + combined[TRACK2_STAT_COL]
     ) * safety_stock_buffer
@@ -370,20 +384,33 @@ def _combine_order_quantities(
     ]
 
 
-def _track2_drug_demand(mart3: pd.DataFrame, target_date: pd.Timestamp) -> pd.DataFrame:
-    """Track 2's per-drug statistical estimate (`TRACK2_STAT_COL`): Mart 3's
-    existing season x weekday backoff grid of expected daily consumption,
-    looked up at `target_date`'s own (계절, 요일) bucket -- no new
-    statistical logic, only a lookup (see CONTEXT.md "Track 2 Sparse-Bucket
-    Backoff")."""
+def _track2_drug_demand(
+    mart3: pd.DataFrame, track2_rare_drugs: pd.DataFrame, target_date: pd.Timestamp
+) -> pd.DataFrame:
+    """Track 2's per-drug statistical estimate (`TRACK2_STAT_COL`) and
+    stock floor (`RARE_STOCK_FLOOR_COL`). For an ordinary drug, Mart 3's
+    season x weekday backoff grid of expected daily consumption, looked up
+    at `target_date`'s own (계절, 요일) bucket (see CONTEXT.md "Track 2
+    Sparse-Bucket Backoff"), with no stock floor. For a rare Acute drug,
+    which has no Mart 3 row, no daily demand -- only its stock floor from
+    `track2_rare_drugs` (see CONTEXT.md "Track 2 Rare-Drug Allocation")."""
     season, weekday = season_and_weekday_for(target_date)
     bucket = mart3.loc[(mart3[SEASON_COL] == season) & (mart3[WEEKDAY_COL] == weekday)]
-    demand = bucket[[DRUG_ID_COL, MART3_VALUE_COL]].rename(
-        columns={MART3_VALUE_COL: TRACK2_STAT_COL}
+    parts = [
+        part
+        for part in (bucket[[DRUG_ID_COL, MART3_VALUE_COL]], track2_rare_drugs)
+        if not part.empty
+    ]
+    demand = (
+        pd.concat(parts, ignore_index=True)
+        if parts
+        else pd.DataFrame(columns=[DRUG_ID_COL, MART3_VALUE_COL])
+    ).reindex(columns=[DRUG_ID_COL, MART3_VALUE_COL, RARE_STOCK_FLOOR_COL])
+    # Pin the dtypes, so an all-empty result never leaves object columns for
+    # downstream fillna to downcast.
+    return demand.rename(columns={MART3_VALUE_COL: TRACK2_STAT_COL}).astype(
+        {TRACK2_STAT_COL: float, RARE_STOCK_FLOOR_COL: float}
     )
-    # `mart3` may be resolve_mart3_backoff's untyped empty frame (no drugs at
-    # all) -- pin the dtype so downstream fillna never downcasts from object.
-    return demand.astype({TRACK2_STAT_COL: float})
 
 
 def _resolve_drug_names(raw_visits: pd.DataFrame) -> pd.Series:

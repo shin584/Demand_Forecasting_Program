@@ -141,6 +141,12 @@ WEEKDAY_COL = "요일"
 # -- not the mean per dispensing (see CONTEXT.md "Mart 3" and issue #36).
 MART3_VALUE_COL = "일평균_소모량"
 MART3_COLUMNS = [DRUG_ID_COL, SEASON_COL, WEEKDAY_COL, MART3_VALUE_COL]
+# Track 2's rare-drug counterpart to Mart 3 (see CONTEXT.md "Track 2
+# Rare-Drug Allocation" and issue #37): per rare Acute drug, its latest
+# single Acute dispensing as a stock floor -- a stock level, never daily
+# demand.
+RARE_STOCK_FLOOR_COL = "희귀약_최소재고"
+TRACK2_RARE_DRUG_COLUMNS = [DRUG_ID_COL, RARE_STOCK_FLOOR_COL]
 
 # Mart 3's fixed bucket axes (see CONTEXT.md "Mart 3 (Acute Drug Statistics
 # Mart)" and "Track 2 Sparse-Bucket Backoff"): standard meteorological
@@ -172,8 +178,9 @@ MART3_SEASON_MIN_DAYS = 15
 
 # Mart 3's rare-drug population filter (see docs/adr/0003-...): a drug with
 # fewer than this many distinct patients (trailing 12 months, as of the
-# snapshot date) gets no Mart 3 row at all -- routed to the rare-drug
-# 100%-allocation rule instead of a shaky statistical estimate. Reuses
+# snapshot date) gets no Mart 3 row at all -- handled by Track 2 Rare-Drug
+# Allocation (`track2_rare_drug_allocation`) instead of a shaky seasonal
+# estimate. Reuses
 # CONTEXT.md's existing rare-drug special-handling cutoff ("Decision
 # Thresholds (provisional)") rather than maintaining a second, independently-
 # tunable "rare" definition.
@@ -1645,17 +1652,24 @@ def _drug_ids_below_patient_threshold(
     if eligible.empty:
         return set()
 
+    patient_counts = _trailing_12_month_patient_counts(eligible, as_of_date)
+    return set(patient_counts.index[patient_counts < patient_threshold])
+
+
+def _trailing_12_month_patient_counts(
+    eligible: pd.DataFrame, as_of_date: pd.Timestamp
+) -> pd.Series:
+    """Per 약품ID in `eligible`, its distinct patients in the trailing 12
+    months ending at `as_of_date` (see `_drug_ids_below_patient_threshold`);
+    0 for a drug with no visit in that window."""
     window_start = as_of_date - pd.DateOffset(months=12)
     visit_dates = pd.to_datetime(eligible[VISIT_DATE_COL])
     windowed = eligible.loc[visit_dates > window_start]
-
-    all_drug_ids = eligible[DRUG_ID_COL].unique()
-    patient_counts = (
+    return (
         windowed.groupby(DRUG_ID_COL)[CUSTOMER_ID_COL]
         .nunique()
-        .reindex(all_drug_ids, fill_value=0)
+        .reindex(eligible[DRUG_ID_COL].unique(), fill_value=0)
     )
-    return set(patient_counts.index[patient_counts < patient_threshold])
 
 
 def _rare_drug_ids(
@@ -1673,6 +1687,50 @@ def _rare_drug_ids(
     """
     eligible = _mart3_eligible_visits(raw_visits, as_of_date, chronic_since)
     return _drug_ids_below_patient_threshold(eligible, as_of_date, rare_drug_patient_threshold)
+
+
+def track2_rare_drug_allocation(
+    raw_visits: pd.DataFrame,
+    as_of_date,
+    rare_drug_patient_threshold: int = RARE_DRUG_PATIENT_THRESHOLD,
+) -> pd.DataFrame:
+    """Track 2's stock floor for the rare Acute drugs Mart 3 leaves out
+    (`_rare_drug_ids`; see CONTEXT.md "Track 2 Rare-Drug Allocation" and
+    issue #37), one row per drug, `TRACK2_RARE_DRUG_COLUMNS`:
+    `RARE_STOCK_FLOOR_COL` is its latest single Acute dispensing with a
+    known 소모량 (the largest, if several fall on that date) -- enough on
+    hand for the next patient.
+
+    A stock level, not daily demand: Track 2 forecasts no daily demand for
+    these drugs at all. Their daily rate over-forecast them 2.7-5.3x on the
+    v0.3 backtest, since a drug is rare precisely because its recent use
+    fell below its history (issue #37).
+
+    Covers only rare drugs with at least one Acute patient in the trailing
+    12 months: one not dispensed for a year needs no stock on hand. Acute visits are
+    Mart 3's own (`_mart3_eligible_visits`), each classified as of its own
+    내방일.
+    """
+    as_of_date = pd.Timestamp(as_of_date)
+    eligible = _mart3_eligible_visits(raw_visits, as_of_date, chronic_since_dates(raw_visits))
+    if eligible.empty:
+        return pd.DataFrame(columns=TRACK2_RARE_DRUG_COLUMNS)
+
+    patient_counts = _trailing_12_month_patient_counts(eligible, as_of_date)
+    rare_recent = patient_counts.index[
+        (patient_counts > 0) & (patient_counts < rare_drug_patient_threshold)
+    ]
+    observations = eligible.loc[eligible[DRUG_ID_COL].isin(rare_recent)]
+    if observations.empty:
+        return pd.DataFrame(columns=TRACK2_RARE_DRUG_COLUMNS)
+
+    # Skip dispensings with a missing 소모량, so the floor rests on the
+    # latest one with a known amount.
+    known = observations.dropna(subset=[CONSUMPTION_COL])
+    known_dates = pd.to_datetime(known[VISIT_DATE_COL])
+    on_latest_date = known_dates == known_dates.groupby(known[DRUG_ID_COL]).transform("max")
+    stock_floor = known.loc[on_latest_date].groupby(DRUG_ID_COL)[CONSUMPTION_COL].max()
+    return stock_floor.rename(RARE_STOCK_FLOOR_COL).reset_index()[TRACK2_RARE_DRUG_COLUMNS]
 
 
 def _track1_eligible_visits(

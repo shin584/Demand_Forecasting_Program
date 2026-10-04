@@ -26,6 +26,7 @@ from pipeline.marts import (
     DRUG_ID_COL,
     DRUG_NAME_COL,
     LONG_TERM_MED_DAYS_COL,
+    RARE_STOCK_FLOOR_COL,
     SNAPSHOT_DATE_COL,
     build_marts,
 )
@@ -662,6 +663,36 @@ def test_final_order_quantity_is_buffered_sum_of_both_tracks():
     assert track1_value == 24.0  # 0.2*40 + 0.8*20
     assert track2_value == 42.0
     assert order.loc[501, FINAL_ORDER_COL] == pytest.approx((track1_value + track2_value) * 2.0)
+
+
+def test_rare_acute_drug_gets_a_stock_floor_but_no_daily_demand():
+    # A single Acute patient -- rare under the default threshold (5), so
+    # drug 501 gets no Mart 3 row: no Track 2 daily demand, only its latest
+    # dispensing as a stock floor, outside 최종발주량.
+    raw_visits = _acute_observation_visits(drug_id=501, visit_date="2024-01-08", consumption=42.0)
+    model = StubModel([])
+
+    result = run_daily_forecast(raw_visits, as_of_date="2024-01-14", model=model)
+
+    order = result.order_quantities.set_index(DRUG_ID_COL)
+    assert order.loc[501, TRACK2_STAT_COL] == 0.0
+    assert order.loc[501, RARE_STOCK_FLOOR_COL] == 42.0
+    assert order.loc[501, FINAL_ORDER_COL] == 0.0
+
+
+def test_non_rare_drug_has_no_stock_floor():
+    raw_visits = _acute_observation_visits(drug_id=501, visit_date="2024-01-08", consumption=42.0)
+    model = StubModel([])
+
+    result = run_daily_forecast(
+        raw_visits,
+        as_of_date="2024-01-14",
+        model=model,
+        rare_drug_patient_threshold=1,
+        mart3_bucket_min_days=1,
+    )
+
+    assert result.order_quantities.set_index(DRUG_ID_COL).loc[501, RARE_STOCK_FLOOR_COL] == 0.0
 
 
 def test_default_safety_stock_buffer_is_1_2():
