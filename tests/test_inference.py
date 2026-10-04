@@ -592,7 +592,7 @@ def test_drug_with_only_a_track2_contribution_has_zero_track1_demand():
         as_of_date="2024-01-14",  # target date 2024-01-15 is also a Monday
         model=model,
         rare_drug_patient_threshold=1,
-        mart3_bucket_min_observations=1,
+        mart3_bucket_min_days=1,
     )
 
     order = result.order_quantities.set_index(DRUG_ID_COL)
@@ -652,7 +652,7 @@ def test_final_order_quantity_is_buffered_sum_of_both_tracks():
         model=model,
         chronic_visit_prob_cutoff=0.3,
         rare_drug_patient_threshold=1,
-        mart3_bucket_min_observations=1,
+        mart3_bucket_min_days=1,
         safety_stock_buffer=2.0,
     )
 
@@ -678,7 +678,7 @@ def test_drug_name_resolved_from_raw_visits():
         as_of_date="2024-01-14",
         model=model,
         rare_drug_patient_threshold=1,
-        mart3_bucket_min_observations=1,
+        mart3_bucket_min_days=1,
     )
 
     order = result.order_quantities.set_index(DRUG_ID_COL)

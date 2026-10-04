@@ -83,11 +83,13 @@ SEVERITY_FLAG_COLS = ["중증암등록대상자", "산전산모대상자", "희�
 # Internal-only columns, not part of the raw_visits schema.
 _DRUG_SET_COL = "_drug_set"
 _CLEAN_DRUG_SET_COL = "_clean_drug_set"
-_BUCKET_MEAN_COL = "_bucket_mean"
-_BUCKET_COUNT_COL = "_bucket_count"
-_SEASON_MEAN_COL = "_season_mean"
-_SEASON_COUNT_COL = "_season_count"
-_DRUG_MEAN_COL = "_drug_mean"
+_BUCKET_SUM_COL = "_bucket_sum"
+_BUCKET_DAYS_COL = "_bucket_days"
+_SEASON_SUM_COL = "_season_sum"
+_SEASON_DAYS_COL = "_season_days"
+_DRUG_SUM_COL = "_drug_sum"
+_DRUG_DAYS_COL = "_drug_days"
+_CALENDAR_DAY_COL = "_calendar_day"
 _MATCHED_ON_COL = "_matched_on"
 
 # 가족_총매출 (as-of) is permanently out of scope, not merely deferred: the
@@ -135,16 +137,19 @@ MART1_BOOLEAN_FEATURE_COLS = [TOMORROW_IS_EXPECTED_VISIT_COL, NEAR_POVERTY_COL]
 MART2_COLUMNS = [CUSTOMER_ID_COL, DRUG_ID_COL, MART2_VALUE_COL]
 SEASON_COL = "계절"
 WEEKDAY_COL = "요일"
-MART3_COLUMNS = [DRUG_ID_COL, SEASON_COL, WEEKDAY_COL, CONSUMPTION_COL]
+# Expected consumption on one calendar day of the bucket, zero days included
+# -- not the mean per dispensing (see CONTEXT.md "Mart 3" and issue #36).
+MART3_VALUE_COL = "일평균_소모량"
+MART3_COLUMNS = [DRUG_ID_COL, SEASON_COL, WEEKDAY_COL, MART3_VALUE_COL]
 
 # Mart 3's fixed bucket axes (see CONTEXT.md "Mart 3 (Acute Drug Statistics
 # Mart)" and "Track 2 Sparse-Bucket Backoff"): standard meteorological
 # seasons, and Korean weekday names (matching dataset/D's weekday-named
 # folders). Every drug present in Mart 3's population gets a row for every
 # one of these 4x7 = 28 combinations, regardless of which buckets that drug
-# actually has observations in -- a drug with zero winter sales still gets a
-# 겨울 row, backed off rather than omitted, since CONTEXT.md's ~72%-sparse
-# figure describes the typical case, not an edge case to skip.
+# was actually dispensed in -- a drug with zero winter sales still gets a
+# 겨울 row (0 once enough winter days have passed, backed off before that),
+# never omitted.
 MART3_SEASONS = ["봄", "여름", "가을", "겨울"]
 MART3_WEEKDAYS = ["월요일", "화요일", "수요일", "목요일", "금요일", "토요일", "일요일"]
 
@@ -158,13 +163,12 @@ _WEEKDAY_INDEX_TO_NAME = dict(enumerate(MART3_WEEKDAYS))
 
 # Mart 3's sparse-bucket backoff thresholds (see CONTEXT.md "Track 2
 # Sparse-Bucket Backoff" and docs/adr/0003-mart3-population-and-backoff-thresholds.md):
-# separate bucket-level and season-level sufficiency bars, since reusing one
-# shared value made the season tier nearly vestigial (a season pools up to 7
-# weekdays of bucket data, so it clears any bucket-sized bar almost
-# automatically). Placeholders pending empirical tuning, not fixed business
+# separate bucket-level and season-level sufficiency bars, counted in
+# calendar days since the drug's first Acute dispensing, not in dispensings
+# (issue #36). Placeholders pending empirical tuning, not fixed business
 # requirements (see CONTEXT.md "Decision Thresholds (provisional)").
-MART3_BUCKET_MIN_OBSERVATIONS = 5
-MART3_SEASON_MIN_OBSERVATIONS = 15
+MART3_BUCKET_MIN_DAYS = 5
+MART3_SEASON_MIN_DAYS = 15
 
 # Mart 3's rare-drug population filter (see docs/adr/0003-...): a drug with
 # fewer than this many distinct patients (trailing 12 months, as of the
@@ -178,7 +182,8 @@ RARE_DRUG_PATIENT_THRESHOLD = 5
 # The Lapse Horizon (see CONTEXT.md "Lapsed Chronic Patient" and
 # docs/adr/0005-lapse-aware-track1-population-and-evaluation.md): a Chronic
 # customer whose latest visit is more than this many days before a snapshot
-# date is Lapsed as of it -- still Chronic (so still out of Mart 3), but
+# date is Lapsed as of it -- still Chronic (so their visits from their
+# Chronic-since Date on stay out of Mart 3), but
 # outside Track 1's population, both in `build_marts`'s Mart 1 snapshot and
 # in every Mart 1 Training Set row. Provisional, like the other Decision
 # Thresholds.
@@ -277,8 +282,8 @@ class Mart1Split(NamedTuple):
 def build_marts(
     raw_visits: pd.DataFrame,
     as_of_date,
-    mart3_bucket_min_observations: int = MART3_BUCKET_MIN_OBSERVATIONS,
-    mart3_season_min_observations: int = MART3_SEASON_MIN_OBSERVATIONS,
+    mart3_bucket_min_days: int = MART3_BUCKET_MIN_DAYS,
+    mart3_season_min_days: int = MART3_SEASON_MIN_DAYS,
     rare_drug_patient_threshold: int = RARE_DRUG_PATIENT_THRESHOLD,
     lapse_horizon_days: int = LAPSE_HORIZON_DAYS,
 ) -> MartResult:
@@ -297,31 +302,33 @@ def build_marts(
     observable after `as_of_date` can't make an earlier snapshot's
     classification "Chronic" (see docs/adr/0002-point-in-time-correctness.md
     and docs/adr/0005-lapse-aware-track1-population-and-evaluation.md).
-    Mart 1 inclusion, 만성질환여부, and Mart 3's population routing all
-    derive from this one as-of-correct result. The top-2 high-frequency drug
+    Mart 1 inclusion and 만성질환여부 derive from this one as-of-correct
+    result; Mart 3's history instead classifies each visit as of its own
+    내방일, from the same Chronic-since Dates (see `_mart3_eligible_visits`). The top-2 high-frequency drug
     exclusion is taken from all of `raw_visits` (see ADR-0005, "Update
     (implementing #26)").
 
-    `mart3_bucket_min_observations`/`mart3_season_min_observations` (defaults
-    `MART3_BUCKET_MIN_OBSERVATIONS`/`MART3_SEASON_MIN_OBSERVATIONS`) are Mart
-    3's sparse-bucket backoff thresholds (see `resolve_mart3_backoff`).
+    `mart3_bucket_min_days`/`mart3_season_min_days` (defaults
+    `MART3_BUCKET_MIN_DAYS`/`MART3_SEASON_MIN_DAYS`) are Mart 3's
+    sparse-bucket backoff thresholds (see `resolve_mart3_backoff`).
     `rare_drug_patient_threshold` (default `RARE_DRUG_PATIENT_THRESHOLD`)
     excludes drugs with too few patients from Mart 3 entirely (see
     `_build_mart3`). `lapse_horizon_days` (default `LAPSE_HORIZON_DAYS`)
     drops Lapsed Chronic customers -- latest visit more than that many days
     before `as_of_date` -- from Mart 1 only; they stay Chronic, so Mart 3
-    still excludes them.
+    still excludes their visits from their Chronic-since Date on.
     """
     as_of_date = pd.Timestamp(as_of_date)
-    chronic_customer_ids = _chronic_customer_ids_as_of(chronic_since_dates(raw_visits), as_of_date)
+    chronic_since = chronic_since_dates(raw_visits)
+    chronic_customer_ids = _chronic_customer_ids_as_of(chronic_since, as_of_date)
     mart1 = _build_mart1(raw_visits, as_of_date, chronic_customer_ids, lapse_horizon_days)
     mart2 = _build_mart2(raw_visits, as_of_date)
     mart3 = _build_mart3(
         raw_visits,
         as_of_date,
-        chronic_customer_ids,
-        mart3_bucket_min_observations,
-        mart3_season_min_observations,
+        chronic_since,
+        mart3_bucket_min_days,
+        mart3_season_min_days,
         rare_drug_patient_threshold,
     )
     return MartResult(mart1=mart1, mart2=mart2, mart3=mart3)
@@ -660,7 +667,7 @@ def _visits_at_or_before(raw_visits: pd.DataFrame, as_of_date: pd.Timestamp) -> 
     """`raw_visits` restricted to rows with 내방일 <= `as_of_date` -- what's
     actually knowable as of that snapshot. Shared by every as-of-date
     computation that must not see visits from after `as_of_date` (Mart 2's
-    latest-consumption lookup, Mart 3's observation population, Mart 1's
+    latest-consumption lookup, Mart 3's Acute visit population, Mart 1's
     severity tier), per docs/adr/0002-point-in-time-correctness.md.
     """
     visit_dates = pd.to_datetime(raw_visits[VISIT_DATE_COL])
@@ -1457,70 +1464,104 @@ def season_and_weekday_for(date) -> tuple[str, str]:
 
 
 def _mart3_eligible_visits(
-    raw_visits: pd.DataFrame, as_of_date: pd.Timestamp, chronic_customer_ids: set
+    raw_visits: pd.DataFrame, as_of_date: pd.Timestamp, chronic_since: pd.Series
 ) -> pd.DataFrame:
-    """Mart 3's shared visit-level population: Acute-Patient visits (the
-    Revisit Match complement of Chronic, see ADR-0001) at or before
-    `as_of_date`, with a non-null 약품ID. Shared by `_mart3_observations`
-    (Mart 3's season x weekday grid input) and `_rare_drug_ids` (the
-    rare-drug population filter, see docs/adr/0003-mart3-population-and-
-    backoff-thresholds.md) so both agree on exactly which visits count as
+    """Mart 3's shared visit-level population: visits at or before
+    `as_of_date`, with a non-null 약품ID, made while the customer was still
+    Acute -- 내방일 on or before their Chronic-since Date (`chronic_since`,
+    from `chronic_since_dates`), or no Chronic-since Date at all.
+
+    Each visit is classified as of its own 내방일, not as of `as_of_date`:
+    the visit on a customer's Chronic-since Date is one Track 1 didn't score
+    the day before, so it's Track 2's to forecast (and lands in Track 2's
+    actual in `pipeline.backtest`). Classifying the whole history as of
+    `as_of_date` instead dropped every visit a now-Chronic customer made
+    while still Acute -- the customers making most of Track 2's actual
+    demand (issue #36). Shared by `_mart3_observations` and
+    `_rare_drug_ids` so both agree on exactly which visits count as
     evidence for a given drug.
     """
-    acute_visits = raw_visits.loc[~raw_visits[CUSTOMER_ID_COL].isin(chronic_customer_ids)]
-    return _visits_at_or_before(acute_visits, as_of_date).dropna(subset=[DRUG_ID_COL])
+    visits = _visits_at_or_before(raw_visits, as_of_date).dropna(subset=[DRUG_ID_COL])
+    customer_chronic_since = visits[CUSTOMER_ID_COL].map(chronic_since)
+    still_acute = customer_chronic_since.isna() | (
+        pd.to_datetime(visits[VISIT_DATE_COL]) <= customer_chronic_since
+    )
+    return visits.loc[still_acute]
 
 
 def _mart3_observations(
-    raw_visits: pd.DataFrame, as_of_date: pd.Timestamp, chronic_customer_ids: set
+    raw_visits: pd.DataFrame, as_of_date: pd.Timestamp, chronic_since: pd.Series
 ) -> pd.DataFrame:
-    """One row per Acute-Patient drug-consumption observation at or before
-    `as_of_date` — Mart 3's population, the Revisit Match complement of
-    Chronic (see ADR-0001; Chronic-patient visits belong to Mart 1 instead
-    and never contribute here). Each row's 계절/요일 are derived from its own
-    내방일, matching `_build_mart2`'s `<=` as-of cutoff (point-in-time
-    correctness for backtesting/inference reuse, see
-    docs/adr/0002-point-in-time-correctness.md).
+    """One row per Acute drug-consumption observation at or before
+    `as_of_date` (see `_mart3_eligible_visits`), with columns 약품ID, 내방일,
+    소모량 -- `resolve_mart3_backoff`'s input. Matches `_build_mart2`'s `<=`
+    as-of cutoff (point-in-time correctness for backtesting/inference reuse,
+    see docs/adr/0002-point-in-time-correctness.md).
     """
-    eligible = _mart3_eligible_visits(raw_visits, as_of_date, chronic_customer_ids)
-    if eligible.empty:
-        return pd.DataFrame(columns=MART3_COLUMNS)
-
-    eligible_dates = pd.to_datetime(eligible[VISIT_DATE_COL])
+    eligible = _mart3_eligible_visits(raw_visits, as_of_date, chronic_since)
     return pd.DataFrame(
         {
             DRUG_ID_COL: eligible[DRUG_ID_COL],
-            SEASON_COL: _seasons_for(eligible_dates),
-            WEEKDAY_COL: _weekdays_for(eligible_dates),
+            VISIT_DATE_COL: pd.to_datetime(eligible[VISIT_DATE_COL]),
             CONSUMPTION_COL: eligible[CONSUMPTION_COL],
         }
     ).reset_index(drop=True)
 
 
+def _drug_bucket_days(first_dates: pd.Series, as_of_date: pd.Timestamp) -> pd.DataFrame:
+    """Per drug x 계절 x 요일, how many calendar days of that bucket fall
+    between the drug's first dispensing (`first_dates`, indexed by 약품ID)
+    and `as_of_date`, both inclusive. Buckets with no such day are absent.
+    """
+    calendar = pd.DataFrame({_CALENDAR_DAY_COL: pd.date_range(first_dates.min(), as_of_date)})
+    calendar[SEASON_COL] = _seasons_for(calendar[_CALENDAR_DAY_COL])
+    calendar[WEEKDAY_COL] = _weekdays_for(calendar[_CALENDAR_DAY_COL])
+    starts = first_dates.to_numpy()
+    frames = []
+    for (season, weekday), days in calendar.groupby([SEASON_COL, WEEKDAY_COL]):
+        bucket_dates = days[_CALENDAR_DAY_COL].to_numpy()
+        frames.append(
+            pd.DataFrame(
+                {
+                    DRUG_ID_COL: first_dates.index,
+                    SEASON_COL: season,
+                    WEEKDAY_COL: weekday,
+                    _BUCKET_DAYS_COL: len(bucket_dates) - np.searchsorted(bucket_dates, starts),
+                }
+            )
+        )
+    bucket_days = pd.concat(frames, ignore_index=True)
+    return bucket_days.loc[bucket_days[_BUCKET_DAYS_COL] > 0]
+
+
 def resolve_mart3_backoff(
     observations: pd.DataFrame,
-    bucket_min_observations: int = MART3_BUCKET_MIN_OBSERVATIONS,
-    season_min_observations: int = MART3_SEASON_MIN_OBSERVATIONS,
+    as_of_date,
+    bucket_min_days: int = MART3_BUCKET_MIN_DAYS,
+    season_min_days: int = MART3_SEASON_MIN_DAYS,
 ) -> pd.DataFrame:
-    """Mart 3's drug x season x weekday grid, from one row per Acute-Patient
-    drug-consumption observation (columns 약품ID, 계절, 요일, 소모량).
+    """Mart 3's drug x season x weekday grid of expected daily consumption
+    (`MART3_VALUE_COL`), from one row per Acute drug-consumption observation
+    (columns 약품ID, 내방일, 소모량) at or before `as_of_date`.
 
-    Every drug present in `observations` gets one row for each of the 28
+    A drug's history is every calendar day from its first dispensing in
+    `observations` to `as_of_date`, and a value is total 소모량 divided by
+    calendar days: days the drug wasn't dispensed count as zeros, so a day
+    the pharmacy is closed resolves to 0 rather than to a dispensing's worth
+    (issue #36), once its bucket has `bucket_min_days` days. A missing
+    소모량 counts as 0, matching how `pipeline.backtest` sums actuals. Every drug present gets one row for each of the 28
     MART3_SEASONS x MART3_WEEKDAYS combinations, via hierarchical backoff
     (see CONTEXT.md "Track 2 Sparse-Bucket Backoff"):
 
-    1. That bucket's own average, if the bucket has >= `bucket_min_observations`
-       observations.
-    2. Else that drug's season-only average (across every weekday), if the
-       season has >= `season_min_observations` observations.
-    3. Else that drug's overall average — used unconditionally as the final
-       fallback, regardless of how few observations it itself rests on, so
-       every bucket resolves to a usable estimate rather than null/zero.
+    1. That bucket's own daily average, if the bucket has >= `bucket_min_days`
+       calendar days in the drug's history.
+    2. Else that drug's season-only daily average (across every weekday), if
+       the season has >= `season_min_days` calendar days.
+    3. Else that drug's overall daily average -- used unconditionally as the
+       final fallback, so every bucket resolves to a usable estimate.
 
-    `bucket_min_observations` and `season_min_observations` are independent
-    thresholds (see docs/adr/0003-mart3-population-and-backoff-thresholds.md)
-    -- a season pools up to 7 weekdays of bucket data, so reusing one shared
-    value would make the season tier nearly vestigial.
+    `bucket_min_days` and `season_min_days` are independent thresholds (see
+    docs/adr/0003-mart3-population-and-backoff-thresholds.md).
 
     Patient-agnostic by design: this function has no access to 고객ID, so
     Mart 3's rare-drug population filter (see `_build_mart3`) must exclude
@@ -1532,43 +1573,51 @@ def resolve_mart3_backoff(
     directly against a small synthetic observation table without needing a
     full multi-visit raw_visits dataset.
     """
-    drug_ids = sorted(observations[DRUG_ID_COL].unique())
-    if not drug_ids:
+    if observations.empty:
         return pd.DataFrame(columns=MART3_COLUMNS)
 
-    bucket_stats = (
-        observations.groupby([DRUG_ID_COL, SEASON_COL, WEEKDAY_COL])[CONSUMPTION_COL]
-        .agg(**{_BUCKET_MEAN_COL: "mean", _BUCKET_COUNT_COL: "count"})
-        .reset_index()
+    as_of_date = pd.Timestamp(as_of_date)
+    visit_dates = pd.to_datetime(observations[VISIT_DATE_COL])
+    observations = observations.assign(
+        **{SEASON_COL: _seasons_for(visit_dates), WEEKDAY_COL: _weekdays_for(visit_dates)}
     )
-    season_stats = (
-        observations.groupby([DRUG_ID_COL, SEASON_COL])[CONSUMPTION_COL]
-        .agg(**{_SEASON_MEAN_COL: "mean", _SEASON_COUNT_COL: "count"})
-        .reset_index()
-    )
-    drug_stats = (
-        observations.groupby(DRUG_ID_COL)[CONSUMPTION_COL]
-        .mean()
-        .rename(_DRUG_MEAN_COL)
-        .reset_index()
-    )
+    first_dates = visit_dates.groupby(observations[DRUG_ID_COL]).min()
+
+    bucket_keys = [DRUG_ID_COL, SEASON_COL, WEEKDAY_COL]
+    season_keys = [DRUG_ID_COL, SEASON_COL]
+    bucket_days = _drug_bucket_days(first_dates, as_of_date)
+    season_days = bucket_days.groupby(season_keys)[_BUCKET_DAYS_COL].sum().rename(_SEASON_DAYS_COL)
+    drug_days = ((as_of_date - first_dates).dt.days + 1).rename(_DRUG_DAYS_COL)
+    consumption = observations[CONSUMPTION_COL]
+    bucket_sums = consumption.groupby([observations[k] for k in bucket_keys]).sum()
+    season_sums = consumption.groupby([observations[k] for k in season_keys]).sum()
+    drug_sums = consumption.groupby(observations[DRUG_ID_COL]).sum()
 
     grid = pd.MultiIndex.from_product(
-        [drug_ids, MART3_SEASONS, MART3_WEEKDAYS],
-        names=[DRUG_ID_COL, SEASON_COL, WEEKDAY_COL],
+        [first_dates.index, MART3_SEASONS, MART3_WEEKDAYS], names=bucket_keys
     ).to_frame(index=False)
-    grid = grid.merge(bucket_stats, on=[DRUG_ID_COL, SEASON_COL, WEEKDAY_COL], how="left")
-    grid = grid.merge(season_stats, on=[DRUG_ID_COL, SEASON_COL], how="left")
-    grid = grid.merge(drug_stats, on=DRUG_ID_COL, how="left")
+    grid = grid.merge(bucket_days, on=bucket_keys, how="left")
+    grid = grid.merge(bucket_sums.rename(_BUCKET_SUM_COL).reset_index(), on=bucket_keys, how="left")
+    grid = grid.merge(season_days.reset_index(), on=season_keys, how="left")
+    grid = grid.merge(season_sums.rename(_SEASON_SUM_COL).reset_index(), on=season_keys, how="left")
+    grid = grid.merge(drug_days.reset_index(), on=DRUG_ID_COL, how="left")
+    grid = grid.merge(drug_sums.rename(_DRUG_SUM_COL).reset_index(), on=DRUG_ID_COL, how="left")
+    # A bucket or season with no calendar day yet, or no dispensing in it,
+    # is absent from the stats above: zero days, zero consumption.
+    grid = grid.fillna(
+        {_BUCKET_DAYS_COL: 0, _BUCKET_SUM_COL: 0.0, _SEASON_DAYS_COL: 0, _SEASON_SUM_COL: 0.0}
+    )
 
-    # NaN counts (bucket/season combinations absent from `observations`)
-    # compare False against each threshold, correctly treated as sparse.
-    bucket_sufficient = grid[_BUCKET_COUNT_COL] >= bucket_min_observations
-    season_sufficient = grid[_SEASON_COUNT_COL] >= season_min_observations
+    bucket_sufficient = grid[_BUCKET_DAYS_COL] >= bucket_min_days
+    season_sufficient = grid[_SEASON_DAYS_COL] >= season_min_days
 
-    grid[CONSUMPTION_COL] = grid[_DRUG_MEAN_COL]
-    grid.loc[season_sufficient, CONSUMPTION_COL] = grid.loc[season_sufficient, _SEASON_MEAN_COL]
-    grid.loc[bucket_sufficient, CONSUMPTION_COL] = grid.loc[bucket_sufficient, _BUCKET_MEAN_COL]
+    grid[MART3_VALUE_COL] = grid[_DRUG_SUM_COL] / grid[_DRUG_DAYS_COL]
+    grid.loc[season_sufficient, MART3_VALUE_COL] = (
+        grid[_SEASON_SUM_COL] / grid[_SEASON_DAYS_COL]
+    )[season_sufficient]
+    grid.loc[bucket_sufficient, MART3_VALUE_COL] = (
+        grid[_BUCKET_SUM_COL] / grid[_BUCKET_DAYS_COL]
+    )[bucket_sufficient]
 
     return grid[MART3_COLUMNS]
 
@@ -1612,17 +1661,17 @@ def _drug_ids_below_patient_threshold(
 def _rare_drug_ids(
     raw_visits: pd.DataFrame,
     as_of_date: pd.Timestamp,
-    chronic_customer_ids: set,
+    chronic_since: pd.Series,
     rare_drug_patient_threshold: int,
 ) -> set:
     """Drug IDs excluded from Mart 3 entirely (see docs/adr/0003-mart3-
     population-and-backoff-thresholds.md): fewer than
     `rare_drug_patient_threshold` distinct patients among that drug's
-    Acute-population visits -- `_mart3_eligible_visits`, the same population
+    Acute visits -- `_mart3_eligible_visits`, the same population
     `_mart3_observations` builds its grid from (see
     `_drug_ids_below_patient_threshold` for the counting methodology).
     """
-    eligible = _mart3_eligible_visits(raw_visits, as_of_date, chronic_customer_ids)
+    eligible = _mart3_eligible_visits(raw_visits, as_of_date, chronic_since)
     return _drug_ids_below_patient_threshold(eligible, as_of_date, rare_drug_patient_threshold)
 
 
@@ -1652,8 +1701,9 @@ def chronic_rare_drug_ids(
     not Mart 3's Acute population -- in the trailing 12 months ending at
     `as_of_date` (see `_drug_ids_below_patient_threshold` for the shared
     counting methodology). The two counts are independent: the same drug can
-    be "rare" under one and not the other, since Track 1 and Track 2 never
-    share a patient population.
+    be "rare" under one and not the other. A customer's visits from before
+    their Chronic-since Date count toward both -- Track 1 serves them now,
+    while Mart 3 classifies each visit as of its own date (issue #36).
 
     Used by `pipeline.inference._track1_drug_demand` to switch a drug from
     ordinary expected-value multiplication to the 100%-allocation sum rule
@@ -1666,16 +1716,14 @@ def chronic_rare_drug_ids(
 def _build_mart3(
     raw_visits: pd.DataFrame,
     as_of_date: pd.Timestamp,
-    chronic_customer_ids: set,
-    bucket_min_observations: int = MART3_BUCKET_MIN_OBSERVATIONS,
-    season_min_observations: int = MART3_SEASON_MIN_OBSERVATIONS,
+    chronic_since: pd.Series,
+    bucket_min_days: int = MART3_BUCKET_MIN_DAYS,
+    season_min_days: int = MART3_SEASON_MIN_DAYS,
     rare_drug_patient_threshold: int = RARE_DRUG_PATIENT_THRESHOLD,
 ) -> pd.DataFrame:
     # No empty-check needed here: resolve_mart3_backoff already returns an
     # empty MART3_COLUMNS frame when `observations` has no rows.
-    observations = _mart3_observations(raw_visits, as_of_date, chronic_customer_ids)
-    rare_drug_ids = _rare_drug_ids(
-        raw_visits, as_of_date, chronic_customer_ids, rare_drug_patient_threshold
-    )
+    observations = _mart3_observations(raw_visits, as_of_date, chronic_since)
+    rare_drug_ids = _rare_drug_ids(raw_visits, as_of_date, chronic_since, rare_drug_patient_threshold)
     observations = observations.loc[~observations[DRUG_ID_COL].isin(rare_drug_ids)]
-    return resolve_mart3_backoff(observations, bucket_min_observations, season_min_observations)
+    return resolve_mart3_backoff(observations, as_of_date, bucket_min_days, season_min_days)

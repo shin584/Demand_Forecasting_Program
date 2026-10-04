@@ -266,6 +266,8 @@ def test_chronic_classification_changes_across_snapshots_on_the_same_raw_dataset
                 조제판매ID=1, 고객ID=1, 내방일="2024-01-01", 다음내방일="2024-01-31", 약품ID=1
             ),
             make_visit_row(조제판매ID=2, 고객ID=1, 내방일="2024-02-15", 약품ID=1),
+            # Drug 2, dispensed once customer 1 is already Chronic.
+            make_visit_row(조제판매ID=3, 고객ID=1, 내방일="2024-02-20", 약품ID=2),
         ]
     )
 
@@ -274,14 +276,18 @@ def test_chronic_classification_changes_across_snapshots_on_the_same_raw_dataset
     # filter (see test_mart3.py), which would otherwise exclude this
     # single-patient drug regardless of its Chronic/Acute routing.
     early = build_marts(raw_visits, as_of_date="2024-01-01", rare_drug_patient_threshold=1)
-    late = build_marts(raw_visits, as_of_date="2024-02-15", rare_drug_patient_threshold=1)
+    late = build_marts(raw_visits, as_of_date="2024-02-20", rare_drug_patient_threshold=1)
 
     assert 1 not in set(early.mart1["고객ID"])
     assert 1 in set(late.mart1["고객ID"])
     assert late.mart1.set_index("고객ID")["만성질환여부"].loc[1] == True  # noqa: E712
 
+    # Mart 3 classifies each visit as of its own date: drug 1's visits came
+    # while customer 1 was still Acute, so they count in both snapshots;
+    # drug 2's came after their Chronic-since Date, so it never does.
     assert 1 in set(early.mart3["약품ID"])
-    assert 1 not in set(late.mart3["약품ID"])
+    assert 1 in set(late.mart3["약품ID"])
+    assert 2 not in set(late.mart3["약품ID"])
 
 
 def test_mart1_does_not_include_department_or_a_substitute_column():

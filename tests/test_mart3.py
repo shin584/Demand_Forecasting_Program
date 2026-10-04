@@ -5,13 +5,15 @@ from conftest import make_high_frequency_filler_visits, make_raw_visits, make_vi
 from pipeline.marts import (
     CONSUMPTION_COL,
     DRUG_ID_COL,
-    MART3_BUCKET_MIN_OBSERVATIONS,
+    MART3_BUCKET_MIN_DAYS,
     MART3_COLUMNS,
-    MART3_SEASON_MIN_OBSERVATIONS,
+    MART3_SEASON_MIN_DAYS,
     MART3_SEASONS,
+    MART3_VALUE_COL,
     MART3_WEEKDAYS,
     RARE_DRUG_PATIENT_THRESHOLD,
     SEASON_COL,
+    VISIT_DATE_COL,
     WEEKDAY_COL,
     build_marts,
     resolve_mart3_backoff,
@@ -19,168 +21,146 @@ from pipeline.marts import (
 )
 
 
-def _observation(drug_id, season, weekday, consumption):
+def _observation(drug_id, visit_date, consumption):
     return {
         DRUG_ID_COL: drug_id,
-        SEASON_COL: season,
-        WEEKDAY_COL: weekday,
+        VISIT_DATE_COL: pd.Timestamp(visit_date),
         CONSUMPTION_COL: consumption,
     }
 
 
-def test_default_bucket_min_observations_is_five():
-    assert MART3_BUCKET_MIN_OBSERVATIONS == 5
+def _daily_value(mart3, drug_id, season, weekday):
+    return mart3.set_index([DRUG_ID_COL, SEASON_COL, WEEKDAY_COL])[MART3_VALUE_COL].loc[
+        (drug_id, season, weekday)
+    ]
 
 
-def test_default_season_min_observations_is_fifteen():
-    assert MART3_SEASON_MIN_OBSERVATIONS == 15
+def test_default_bucket_min_days_is_five():
+    assert MART3_BUCKET_MIN_DAYS == 5
+
+
+def test_default_season_min_days_is_fifteen():
+    assert MART3_SEASON_MIN_DAYS == 15
 
 
 def test_default_rare_drug_patient_threshold_is_five():
     assert RARE_DRUG_PATIENT_THRESHOLD == 5
 
 
-def test_well_populated_bucket_returns_its_own_average():
+def test_bucket_value_is_its_total_consumption_over_its_calendar_days():
+    # Drug 1 first dispensed Monday 2024-01-01; as of Sunday 2024-01-28 its
+    # 겨울/월요일 bucket spans 4 calendar Mondays (1, 8, 15, 22), two of
+    # them with no dispensing at all -- those count as zero days, so the
+    # bucket holds expected daily consumption, not the mean per dispensing.
     observations = pd.DataFrame(
         [
-            _observation(1, "겨울", "월요일", 10.0),
-            _observation(1, "겨울", "월요일", 20.0),
-            _observation(1, "겨울", "월요일", 30.0),
+            _observation(1, "2024-01-01", 10.0),
+            _observation(1, "2024-01-08", 20.0),
             # A different bucket for the same drug -- proves the resolved
             # value comes from the bucket itself, not some wider average.
-            _observation(1, "여름", "화요일", 999.0),
+            _observation(1, "2024-01-02", 999.0),
         ]
     )
 
-    mart3 = resolve_mart3_backoff(observations, bucket_min_observations=3)
+    mart3 = resolve_mart3_backoff(observations, "2024-01-28", bucket_min_days=4)
 
-    bucket = mart3.set_index([DRUG_ID_COL, SEASON_COL, WEEKDAY_COL])[CONSUMPTION_COL]
-    assert bucket.loc[(1, "겨울", "월요일")] == 20.0
+    assert _daily_value(mart3, 1, "겨울", "월요일") == pytest.approx((10.0 + 20.0) / 4)
 
 
-def test_sparse_bucket_falls_back_to_season_average():
+def test_bucket_with_days_but_no_dispensing_resolves_to_zero():
+    # Sundays (the pharmacy's closed day) have 4 calendar days in the
+    # window but no dispensing -- a genuine zero, not a gap to back off from.
+    observations = pd.DataFrame([_observation(1, "2024-01-01", 10.0)])
+
+    mart3 = resolve_mart3_backoff(observations, "2024-01-28", bucket_min_days=4)
+
+    assert _daily_value(mart3, 1, "겨울", "일요일") == 0.0
+
+
+def test_bucket_days_are_counted_from_the_drugs_own_first_dispensing():
+    # Drug 2 is first dispensed Monday 2024-01-15, so as of 2024-01-28 its
+    # 겨울/월요일 bucket spans only 2 Mondays (15, 22) -- not the 4 drug 1's
+    # earlier first dispensing gives it.
     observations = pd.DataFrame(
         [
-            # Bucket (여름, 화요일) has only 1 observation -- below threshold.
-            _observation(2, "여름", "화요일", 100.0),
-            # More observations elsewhere in the same season, pushing the
-            # season-level count over threshold.
-            _observation(2, "여름", "수요일", 20.0),
-            _observation(2, "여름", "수요일", 40.0),
+            _observation(1, "2024-01-01", 10.0),
+            _observation(2, "2024-01-15", 30.0),
+        ]
+    )
+
+    mart3 = resolve_mart3_backoff(observations, "2024-01-28", bucket_min_days=2)
+
+    assert _daily_value(mart3, 2, "겨울", "월요일") == pytest.approx(30.0 / 2)
+    assert _daily_value(mart3, 1, "겨울", "월요일") == pytest.approx(10.0 / 4)
+
+
+def test_bucket_with_too_few_days_falls_back_to_season_daily_average():
+    # First dispensed Monday 2024-01-01, as of Wednesday 2024-01-10: 10
+    # winter days, only 2 of them Mondays.
+    observations = pd.DataFrame(
+        [
+            _observation(2, "2024-01-01", 100.0),
+            _observation(2, "2024-01-03", 20.0),
+            _observation(2, "2024-01-10", 40.0),
         ]
     )
 
     mart3 = resolve_mart3_backoff(
-        observations, bucket_min_observations=3, season_min_observations=3
+        observations, "2024-01-10", bucket_min_days=3, season_min_days=10
     )
 
-    bucket = mart3.set_index([DRUG_ID_COL, SEASON_COL, WEEKDAY_COL])[CONSUMPTION_COL]
-    expected_season_avg = (100.0 + 20.0 + 40.0) / 3
-    assert bucket.loc[(2, "여름", "화요일")] == pytest.approx(expected_season_avg)
+    assert _daily_value(mart3, 2, "겨울", "월요일") == pytest.approx((100.0 + 20.0 + 40.0) / 10)
 
 
-def test_sparse_at_both_levels_falls_back_to_drug_overall_average():
+@pytest.mark.parametrize(
+    ("season_min_days", "expected"),
+    # 11 winter days (2024-02-19 to 02-29) and 3 spring days (03-01 to
+    # 03-03): the 겨울/월요일 bucket (2 Mondays) is short of bucket_min_days
+    # either way, so season_min_days alone decides between the winter
+    # season's daily average and the drug's overall one.
+    [(11, 22.0 / 11), (12, (22.0 + 70.0) / 14)],
+)
+def test_season_min_days_decides_between_season_and_overall_daily_average(
+    season_min_days, expected
+):
     observations = pd.DataFrame(
         [
-            _observation(3, "가을", "목요일", 50.0),
-            # A single observation in a different season -- contributes only
-            # to the drug's overall average, not to a season-level rescue.
-            _observation(3, "봄", "월요일", 150.0),
+            _observation(3, "2024-02-19", 22.0),
+            _observation(3, "2024-03-01", 70.0),
         ]
     )
 
     mart3 = resolve_mart3_backoff(
-        observations, bucket_min_observations=3, season_min_observations=3
+        observations, "2024-03-03", bucket_min_days=3, season_min_days=season_min_days
     )
 
-    bucket = mart3.set_index([DRUG_ID_COL, SEASON_COL, WEEKDAY_COL])[CONSUMPTION_COL]
-    expected_overall_avg = (50.0 + 150.0) / 2
-    assert bucket.loc[(3, "가을", "목요일")] == pytest.approx(expected_overall_avg)
+    assert _daily_value(mart3, 3, "겨울", "월요일") == pytest.approx(expected)
 
 
-def test_bucket_min_observations_threshold_is_overridable():
+def test_season_with_no_days_yet_falls_back_to_overall_daily_average():
+    # First dispensed 2024-01-01, as of 2024-01-10: no summer day has
+    # happened since, so every 여름 bucket rests on the overall average.
+    observations = pd.DataFrame([_observation(4, "2024-01-01", 50.0)])
+
+    mart3 = resolve_mart3_backoff(observations, "2024-01-10")
+
+    assert _daily_value(mart3, 4, "여름", "화요일") == pytest.approx(50.0 / 10)
+
+
+def test_missing_consumption_counts_as_zero():
     observations = pd.DataFrame(
-        [
-            _observation(4, "봄", "금요일", 10.0),
-            _observation(4, "봄", "금요일", 30.0),
-            _observation(4, "여름", "토요일", 1000.0),
-            _observation(4, "여름", "토요일", 1000.0),
-            _observation(4, "여름", "토요일", 1000.0),
-            _observation(4, "여름", "토요일", 1000.0),
-            _observation(4, "여름", "토요일", 1000.0),
-        ]
+        [_observation(1, "2024-01-01", 10.0), _observation(1, "2024-01-08", float("nan"))]
     )
 
-    strict = resolve_mart3_backoff(
-        observations, bucket_min_observations=3, season_min_observations=3
-    )
-    lenient = resolve_mart3_backoff(
-        observations, bucket_min_observations=2, season_min_observations=2
-    )
+    mart3 = resolve_mart3_backoff(observations, "2024-01-28", bucket_min_days=4)
 
-    strict_value = strict.set_index([DRUG_ID_COL, SEASON_COL, WEEKDAY_COL])[
-        CONSUMPTION_COL
-    ].loc[(4, "봄", "금요일")]
-    lenient_value = lenient.set_index([DRUG_ID_COL, SEASON_COL, WEEKDAY_COL])[
-        CONSUMPTION_COL
-    ].loc[(4, "봄", "금요일")]
-
-    # threshold=2: the bucket's own 2 observations meet the bar.
-    assert lenient_value == 20.0
-    # threshold=3: the bucket (and its season, which pools the same 2
-    # observations) fall short, so it backs off all the way to the drug's
-    # overall average across all 7 observations.
-    assert strict_value == pytest.approx((10 + 30 + 1000 * 5) / 7)
-
-
-def test_season_sufficient_under_old_shared_threshold_but_not_new_falls_through_to_drug_average():
-    # Season count is 8 -- would have cleared the old shared threshold (5),
-    # but falls short of a materially higher season_min_observations (10).
-    # The bucket itself (2 observations) is insufficient either way, so with
-    # both tiers now insufficient, the result must fall all the way through
-    # to the drug's overall average rather than resting on the season.
-    observations = pd.DataFrame(
-        [
-            _observation(6, "봄", "월요일", 10.0),
-            _observation(6, "봄", "월요일", 20.0),
-        ]
-        + [_observation(6, "봄", "화요일", 100.0) for _ in range(6)]
-    )
-
-    mart3 = resolve_mart3_backoff(
-        observations, bucket_min_observations=5, season_min_observations=10
-    )
-
-    bucket = mart3.set_index([DRUG_ID_COL, SEASON_COL, WEEKDAY_COL])[CONSUMPTION_COL]
-    expected_overall_avg = (10.0 + 20.0 + 100.0 * 6) / 8
-    assert bucket.loc[(6, "봄", "월요일")] == pytest.approx(expected_overall_avg)
-
-
-def test_season_clears_materially_higher_threshold_still_falls_back_to_season_average():
-    # Season count is 15 -- clears a materially higher season_min_observations
-    # bar than the old shared threshold ever required. The bucket itself is
-    # insufficient, so the season average is still used.
-    observations = pd.DataFrame(
-        [
-            _observation(7, "여름", "월요일", 10.0),
-            _observation(7, "여름", "월요일", 20.0),
-        ]
-        + [_observation(7, "여름", "화요일", 100.0) for _ in range(13)]
-    )
-
-    mart3 = resolve_mart3_backoff(
-        observations, bucket_min_observations=5, season_min_observations=15
-    )
-
-    bucket = mart3.set_index([DRUG_ID_COL, SEASON_COL, WEEKDAY_COL])[CONSUMPTION_COL]
-    expected_season_avg = (10.0 + 20.0 + 100.0 * 13) / 15
-    assert bucket.loc[(7, "여름", "월요일")] == pytest.approx(expected_season_avg)
+    assert _daily_value(mart3, 1, "겨울", "월요일") == pytest.approx(10.0 / 4)
 
 
 def test_every_drug_gets_a_full_season_by_weekday_grid():
-    observations = pd.DataFrame([_observation(5, "봄", "월요일", 42.0)])
+    observations = pd.DataFrame([_observation(5, "2024-01-01", 42.0)])
 
-    mart3 = resolve_mart3_backoff(observations, bucket_min_observations=1)
+    mart3 = resolve_mart3_backoff(observations, "2024-01-01", bucket_min_days=1)
 
     combos = set(zip(mart3[DRUG_ID_COL], mart3[SEASON_COL], mart3[WEEKDAY_COL]))
     expected = {
@@ -190,44 +170,68 @@ def test_every_drug_gets_a_full_season_by_weekday_grid():
     assert list(mart3.columns) == MART3_COLUMNS
 
 
-def test_mart3_built_only_from_acute_patient_visits():
+def test_no_observations_gives_an_empty_mart3():
+    observations = pd.DataFrame(columns=[DRUG_ID_COL, VISIT_DATE_COL, CONSUMPTION_COL])
+
+    mart3 = resolve_mart3_backoff(observations, "2024-01-01")
+
+    assert mart3.empty
+    assert list(mart3.columns) == MART3_COLUMNS
+
+
+# More filler occurrences than 약품ID=1 gets in any fixture below, so it
+# stays outside the Revisit Match top-2 exclusion (see ADR-0001).
+_FILLER_OCCURRENCES = 6
+
+
+def _chronic_customer_1_visits(post_chronic_consumption=999.0):
+    """Customer 1 becomes Chronic on 2024-02-01 -- the later visit of a
+    Revisit Match on 약품ID=1 within +/-30 days of its 다음내방일 -- then
+    gets 약품ID=1 once more afterwards, on 2024-02-12."""
+    return [
+        make_visit_row(
+            조제판매ID=1, 고객ID=1, 내방일="2024-01-15", 다음내방일="2024-02-14", 약품ID=1, 소모량=7.0
+        ),
+        make_visit_row(조제판매ID=2, 고객ID=1, 내방일="2024-02-01", 약품ID=1, 소모량=7.0),
+        make_visit_row(
+            조제판매ID=3, 고객ID=1, 내방일="2024-02-12", 약품ID=1, 소모량=post_chronic_consumption
+        ),
+    ]
+
+
+def test_mart3_excludes_visits_made_after_the_customer_became_chronic():
+    filler = make_high_frequency_filler_visits(_FILLER_OCCURRENCES)
+    acute = [make_visit_row(조제판매ID=4, 고객ID=2, 내방일="2024-01-15", 약품ID=1, 소모량=50.0)]
+    kwargs = dict(as_of_date="2024-03-01", mart3_bucket_min_days=1, rare_drug_patient_threshold=1)
+
+    with_post_chronic = build_marts(
+        make_raw_visits(filler + _chronic_customer_1_visits(999.0) + acute), **kwargs
+    ).mart3
+    without_post_chronic = build_marts(
+        make_raw_visits(filler + _chronic_customer_1_visits(0.0) + acute), **kwargs
+    ).mart3
+
+    pd.testing.assert_frame_equal(with_post_chronic, without_post_chronic)
+
+
+def test_mart3_counts_a_chronic_customers_visits_up_to_their_chronic_since_date():
+    # Customer 1's visits on 2024-01-15 and on their Chronic-since Date
+    # (2024-02-01, a Thursday) came while they were still Acute -- Track 1
+    # didn't score them the day before -- so Mart 3 counts both, even
+    # though customer 1 is Chronic by as_of_date.
     raw_visits = make_raw_visits(
-        # occurrences=4 keeps 90001/90002 strictly more frequent than 약품ID=1
-        # (3 occurrences below), so 약품ID=1 isn't itself swept into the
-        # Revisit Match top-2 exclusion (see ADR-0001).
-        make_high_frequency_filler_visits(4)
-        + [
-            # Customer 1: Chronic via Revisit Match on 약품ID=1 within the
-            # +/-30 day window of its 다음내방일 -- must not contribute.
-            make_visit_row(
-                조제판매ID=1,
-                고객ID=1,
-                내방일="2024-01-15",
-                다음내방일="2024-02-14",
-                약품ID=1,
-                소모량=999.0,
-            ),
-            make_visit_row(
-                조제판매ID=2, 고객ID=1, 내방일="2024-02-01", 약품ID=1, 소모량=999.0
-            ),
-            # Customer 2: Acute -- single visit, no Revisit Match possible --
-            # does contribute.
-            make_visit_row(
-                조제판매ID=3, 고객ID=2, 내방일="2024-01-15", 약품ID=1, 소모량=50.0
-            ),
-        ]
+        make_high_frequency_filler_visits(_FILLER_OCCURRENCES) + _chronic_customer_1_visits()
     )
 
     mart3 = build_marts(
-        raw_visits,
-        as_of_date="2024-03-01",
-        mart3_bucket_min_observations=1,
-        rare_drug_patient_threshold=1,
+        raw_visits, as_of_date="2024-03-01", mart3_bucket_min_days=1, rare_drug_patient_threshold=1
     ).mart3
 
-    drug1_values = mart3.loc[mart3[DRUG_ID_COL] == 1, CONSUMPTION_COL]
-    assert not drug1_values.empty
-    assert (drug1_values == 50.0).all()
+    # Drug 1 was first dispensed 2024-01-15; winter runs to 2024-02-29.
+    winter_thursdays = pd.date_range("2024-01-15", "2024-02-29", freq="W-THU")
+    assert _daily_value(mart3, 1, "겨울", "목요일") == pytest.approx(7.0 / len(winter_thursdays))
+    winter_mondays = pd.date_range("2024-01-15", "2024-02-29", freq="W-MON")
+    assert _daily_value(mart3, 1, "겨울", "월요일") == pytest.approx(7.0 / len(winter_mondays))
 
 
 def test_mart3_excludes_visits_after_as_of_date():
@@ -245,29 +249,27 @@ def test_mart3_excludes_visits_after_as_of_date():
     mart3 = build_marts(
         raw_visits,
         as_of_date="2024-02-01",
-        mart3_bucket_min_observations=1,
+        mart3_bucket_min_days=1,
         rare_drug_patient_threshold=1,
     ).mart3
 
-    drug1_values = mart3.loc[mart3[DRUG_ID_COL] == 1, CONSUMPTION_COL]
-    assert not drug1_values.empty
-    assert (drug1_values == 50.0).all()
+    # Only the 2024-01-15 Monday dispensing, over the 3 Mondays (01-15,
+    # 01-22, 01-29) since.
+    assert _daily_value(mart3, 1, "겨울", "월요일") == pytest.approx(50.0 / 3)
+    assert mart3[MART3_VALUE_COL].max() < 999.0
 
 
-def test_build_marts_mart3_bucket_min_observations_is_overridable():
+def test_build_marts_mart3_bucket_min_days_is_overridable():
     raw_visits = make_raw_visits(
         [
-            # Winter Mondays -- same bucket, 2 observations.
+            # Monday 2024-01-15, then nothing else until a summer dispensing,
+            # so the drug's 겨울/월요일 bucket spans 7 Mondays (01-15 to
+            # 02-26).
             make_visit_row(
-                조제판매ID=1, 고객ID=1, 내방일="2024-01-15", 약품ID=1, 소모량=10.0
+                조제판매ID=1, 고객ID=1, 내방일="2024-01-15", 약품ID=1, 소모량=70.0
             ),
             make_visit_row(
-                조제판매ID=2, 고객ID=2, 내방일="2024-01-22", 약품ID=1, 소모량=30.0
-            ),
-            # A third, differently-bucketed observation, so the bucket
-            # average (20.0) differs from the drug's overall average.
-            make_visit_row(
-                조제판매ID=3, 고객ID=3, 내방일="2024-07-03", 약품ID=1, 소모량=400.0
+                조제판매ID=2, 고객ID=2, 내방일="2024-07-03", 약품ID=1, 소모량=400.0
             ),
         ]
     )
@@ -275,52 +277,48 @@ def test_build_marts_mart3_bucket_min_observations_is_overridable():
     default_mart3 = build_marts(
         raw_visits, as_of_date="2024-08-01", rare_drug_patient_threshold=1
     ).mart3
-    lenient_mart3 = build_marts(
+    strict_mart3 = build_marts(
         raw_visits,
         as_of_date="2024-08-01",
-        mart3_bucket_min_observations=2,
+        mart3_bucket_min_days=8,
         rare_drug_patient_threshold=1,
     ).mart3
 
-    bucket = (1, "겨울", "월요일")
-    default_value = default_mart3.set_index([DRUG_ID_COL, SEASON_COL, WEEKDAY_COL])[
-        CONSUMPTION_COL
-    ].loc[bucket]
-    lenient_value = lenient_mart3.set_index([DRUG_ID_COL, SEASON_COL, WEEKDAY_COL])[
-        CONSUMPTION_COL
-    ].loc[bucket]
-
-    # Default threshold (5) isn't met by 2 observations, so it backs off all
-    # the way to the drug's overall average across all 3 observations.
-    assert default_value == pytest.approx((10 + 30 + 400) / 3)
-    # threshold=2: the bucket's own 2 observations meet the bar.
-    assert lenient_value == 20.0
+    # Default (5): the bucket's own 7 days suffice.
+    assert _daily_value(default_mart3, 1, "겨울", "월요일") == pytest.approx(70.0 / 7)
+    # 8: the bucket falls short, so the winter season's daily average
+    # (46 days from 01-15 to 02-29, which clears the default season bar).
+    assert _daily_value(strict_mart3, 1, "겨울", "월요일") == pytest.approx(70.0 / 46)
 
 
-def test_mart3_excludes_a_chronic_only_drug_entirely():
-    # Customer 1 is Chronic (a genuine Revisit Match on 약품ID=1), so 약품ID=1
-    # contributes nothing to Mart 3 -- only the filler customers' visits
-    # (Acute, single-visit) do.
+def test_mart3_excludes_a_drug_only_dispensed_after_customers_became_chronic():
+    # 약품ID=3 is only ever dispensed on customer 1's post-Chronic-since
+    # visit, so it gets no Mart 3 row at all.
     raw_visits = make_raw_visits(
-        make_high_frequency_filler_visits(4)
-        + [
-            make_visit_row(
-                조제판매ID=1,
-                고객ID=1,
-                내방일="2024-01-01",
-                다음내방일="2024-01-31",
-                약품ID=1,
-            ),
-            make_visit_row(조제판매ID=2, 고객ID=1, 내방일="2024-01-15", 약품ID=1),
-        ]
+        make_high_frequency_filler_visits(_FILLER_OCCURRENCES)
+        + _chronic_customer_1_visits()
+        + [make_visit_row(조제판매ID=3, 고객ID=1, 내방일="2024-02-12", 약품ID=3)]
     )
 
-    # as_of_date is at (not before) customer 1's revisit, so the match is
-    # already knowable at this snapshot (see issue #11).
-    mart3 = build_marts(raw_visits, as_of_date="2024-01-15").mart3
+    mart3 = build_marts(raw_visits, as_of_date="2024-03-01", rare_drug_patient_threshold=1).mart3
 
     assert list(mart3.columns) == MART3_COLUMNS
-    assert 1 not in set(mart3[DRUG_ID_COL])
+    assert 3 not in set(mart3[DRUG_ID_COL])
+    assert 1 in set(mart3[DRUG_ID_COL])
+
+
+def test_mart3_rare_drug_count_includes_patients_from_before_they_became_chronic():
+    # Customer 1 is Chronic by as_of_date, but got 약품ID=1 while still
+    # Acute -- so together with Acute customer 2 the drug has 2 patients.
+    raw_visits = make_raw_visits(
+        make_high_frequency_filler_visits(_FILLER_OCCURRENCES)
+        + _chronic_customer_1_visits()
+        + [make_visit_row(조제판매ID=4, 고객ID=2, 내방일="2024-01-20", 약품ID=1)]
+    )
+
+    mart3 = build_marts(raw_visits, as_of_date="2024-03-01", rare_drug_patient_threshold=2).mart3
+
+    assert 1 in set(mart3[DRUG_ID_COL])
 
 
 def test_mart3_excludes_a_drug_below_the_rare_drug_patient_threshold():

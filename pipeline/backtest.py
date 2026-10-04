@@ -3,8 +3,8 @@ one calendar day at a time across a test window, comparing pre-buffer
 combined per-drug demand to actual per-drug consumption and reporting WAPE.
 
 See CONTEXT.md ("Safety Stock", "Decision Thresholds (provisional)"),
-docs/adr/0003-mart3-population-and-backoff-thresholds.md ("no Track 2
-evaluation harness exists yet in the repo"), and issue #18 for the design
+docs/adr/0003-mart3-population-and-backoff-thresholds.md (written before
+this harness existed), and issue #18 for the design
 this encodes. Consumes `pipeline.inference.run_daily_forecast`'s public seam
 unchanged -- no separate reimplementation of the combination/allocation
 logic, so this harness can't silently drift from what actually ships.

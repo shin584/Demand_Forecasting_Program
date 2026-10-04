@@ -21,14 +21,14 @@ from typing import NamedTuple
 import pandas as pd
 
 from .marts import (
-    CONSUMPTION_COL,
     CUSTOMER_ID_COL,
     DRUG_ID_COL,
     DRUG_NAME_COL,
     LAPSE_HORIZON_DAYS,
     MART2_VALUE_COL,
-    MART3_BUCKET_MIN_OBSERVATIONS,
-    MART3_SEASON_MIN_OBSERVATIONS,
+    MART3_BUCKET_MIN_DAYS,
+    MART3_SEASON_MIN_DAYS,
+    MART3_VALUE_COL,
     RARE_DRUG_PATIENT_THRESHOLD,
     SEASON_COL,
     SNAPSHOT_DATE_COL,
@@ -278,8 +278,8 @@ def run_daily_forecast(
     model,
     chronic_visit_prob_cutoff: float | None = None,
     safety_stock_buffer: float = SAFETY_STOCK_BUFFER,
-    mart3_bucket_min_observations: int = MART3_BUCKET_MIN_OBSERVATIONS,
-    mart3_season_min_observations: int = MART3_SEASON_MIN_OBSERVATIONS,
+    mart3_bucket_min_days: int = MART3_BUCKET_MIN_DAYS,
+    mart3_season_min_days: int = MART3_SEASON_MIN_DAYS,
     rare_drug_patient_threshold: int = RARE_DRUG_PATIENT_THRESHOLD,
     lapse_horizon_days: int = LAPSE_HORIZON_DAYS,
 ) -> ForecastResult:
@@ -287,7 +287,7 @@ def run_daily_forecast(
     (`run_track1_inference`) combined with Track 2's Mart 3 lookup into the
     final per-drug order-quantity table.
 
-    `mart3_bucket_min_observations`/`mart3_season_min_observations` are
+    `mart3_bucket_min_days`/`mart3_season_min_days` are
     forwarded to `build_marts` for Mart 3 only (see that function) -- they
     don't affect Track 1's own Mart 1/Mart 2-based computation. `rare_drug_patient_threshold` is forwarded to both:
     Mart 3's Acute-population rare-drug filter and Track 1's own
@@ -313,8 +313,8 @@ def run_daily_forecast(
     mart1, mart2, mart3 = build_marts(
         raw_visits,
         as_of_date,
-        mart3_bucket_min_observations=mart3_bucket_min_observations,
-        mart3_season_min_observations=mart3_season_min_observations,
+        mart3_bucket_min_days=mart3_bucket_min_days,
+        mart3_season_min_days=mart3_season_min_days,
         rare_drug_patient_threshold=rare_drug_patient_threshold,
         lapse_horizon_days=lapse_horizon_days,
     )
@@ -372,12 +372,15 @@ def _combine_order_quantities(
 
 def _track2_drug_demand(mart3: pd.DataFrame, target_date: pd.Timestamp) -> pd.DataFrame:
     """Track 2's per-drug statistical estimate (`TRACK2_STAT_COL`): Mart 3's
-    existing season x weekday backoff grid, looked up at `target_date`'s own
-    (계절, 요일) bucket -- no new statistical logic, only a lookup (see
-    CONTEXT.md "Track 2 Sparse-Bucket Backoff")."""
+    existing season x weekday backoff grid of expected daily consumption,
+    looked up at `target_date`'s own (계절, 요일) bucket -- no new
+    statistical logic, only a lookup (see CONTEXT.md "Track 2 Sparse-Bucket
+    Backoff")."""
     season, weekday = season_and_weekday_for(target_date)
     bucket = mart3.loc[(mart3[SEASON_COL] == season) & (mart3[WEEKDAY_COL] == weekday)]
-    demand = bucket[[DRUG_ID_COL, CONSUMPTION_COL]].rename(columns={CONSUMPTION_COL: TRACK2_STAT_COL})
+    demand = bucket[[DRUG_ID_COL, MART3_VALUE_COL]].rename(
+        columns={MART3_VALUE_COL: TRACK2_STAT_COL}
+    )
     # `mart3` may be resolve_mart3_backoff's untyped empty frame (no drugs at
     # all) -- pin the dtype so downstream fillna never downcasts from object.
     return demand.astype({TRACK2_STAT_COL: float})

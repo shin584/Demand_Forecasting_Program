@@ -64,26 +64,23 @@ def test_lapse_horizon_is_overridable():
 
 
 def test_lapsed_chronic_customer_stays_out_of_mart3():
-    # Customer 1 is Lapsed as of the snapshot but still Chronic, so their
-    # drug-1 consumption must not route to Mart 3; acute customer 2's does.
+    # Customer 1 is Lapsed as of the snapshot but still Chronic, so a drug
+    # they got only after their Chronic-since Date (_LAST_VISIT) must not
+    # route to Mart 3.
+    post_chronic_visit = _LAST_VISIT + pd.Timedelta(days=1)
     raw_visits = make_raw_visits(
         make_high_frequency_filler_visits(_FILLER_OCCURRENCES)
-        + _chronic_customer(소모량=999.0)
-        + [make_visit_row(조제판매ID=3, 고객ID=2, 가족ID=2, 내방일="2024-01-15", 약품ID=1, 소모량=50.0)]
+        + _chronic_customer()
+        + [make_visit_row(조제판매ID=3, 고객ID=1, 내방일=str(post_chronic_visit.date()), 약품ID=2)]
     )
-    as_of_date = _LAST_VISIT + pd.Timedelta(days=LAPSE_HORIZON_DAYS + 1)
+    as_of_date = post_chronic_visit + pd.Timedelta(days=LAPSE_HORIZON_DAYS + 1)
 
-    result = build_marts(
-        raw_visits,
-        as_of_date=as_of_date,
-        mart3_bucket_min_observations=1,
-        rare_drug_patient_threshold=1,
-    )
+    result = build_marts(raw_visits, as_of_date=as_of_date, rare_drug_patient_threshold=1)
 
     assert 1 not in set(result.mart1["고객ID"])
-    drug1_values = result.mart3.loc[result.mart3["약품ID"] == 1, "소모량"]
-    assert not drug1_values.empty
-    assert (drug1_values == 50.0).all()
+    assert 2 not in set(result.mart3["약품ID"])
+    # Their drug-1 visits came up to their Chronic-since Date -- still Acute.
+    assert 1 in set(result.mart3["약품ID"])
 
 
 @pytest.mark.parametrize(

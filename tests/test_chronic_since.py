@@ -128,4 +128,6 @@ def test_build_marts_chronic_on_and_after_the_chronic_since_date():
 
         assert 1 in set(result.mart1["고객ID"]), as_of_date
         assert result.mart1.set_index("고객ID")["만성질환여부"].loc[1] == True, as_of_date  # noqa: E712
-        assert 1 not in set(result.mart3["약품ID"]), as_of_date
+        # Both visits came on or before the Chronic-since Date, so Mart 3
+        # still counts them as Acute visits (see test_mart3.py).
+        assert 1 in set(result.mart3["약품ID"]), as_of_date
