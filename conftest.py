@@ -8,6 +8,8 @@ hand for every test.
 
 import pandas as pd
 
+from pipeline.pharmacy_calendar import PharmacyCalendar
+
 RAW_VISIT_COLUMNS = [
     "조제판매ID",
     "고객ID",
@@ -149,3 +151,10 @@ def make_independent_chronic_match_visits(
             조제판매ID=visit_id_start + 1, 고객ID=customer_id, 내방일="2023-11-15", 약품ID=drug_id
         ),
     ]
+
+
+def closed_on(*dates: str) -> PharmacyCalendar:
+    """A pharmacy calendar closed on exactly `dates` and open every other
+    day, Sundays included -- so a test's closures are only the ones it
+    names."""
+    return PharmacyCalendar(closed_days=pd.DatetimeIndex(dates), observed_through=None)

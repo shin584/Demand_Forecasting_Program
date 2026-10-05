@@ -24,6 +24,7 @@ from scipy.special import expit, logit
 from sklearn.metrics import precision_recall_curve, roc_auc_score
 
 from .marts import (
+    CLOSED_TOMORROW_COL,
     GENDER_COL,
     INSURANCE_TYPE_COL,
     MART1_COLUMNS,
@@ -173,6 +174,14 @@ def train_track1_model(
     stopping to monitor), then Platt-calibrates it on `val` and tunes the
     Chronic cutoff on the calibrated `val` probabilities.
 
+    Probabilities on a closed target day (내일_휴무) are 0 whatever the
+    classifier says (see `visit_probabilities`), so the calibrator is fit
+    on `val`'s open-day rows only -- fitting it on closed-day rows, where
+    nobody visits, would drag every open day's probability below its real
+    visit rate. The cutoff, metrics and Σp check all use
+    `visit_probabilities`, closed days included, exactly as inference sees
+    them.
+
     `train`/`val`/`test` are Mart 1 rows (matching
     `MART1_TRAINING_COLUMNS`/`MART1_COLUMNS` -- see
     `pipeline.marts.split_mart1_training_set`): X-features (`FEATURE_COLS`)
@@ -210,9 +219,12 @@ def train_track1_model(
         callbacks=[lgb.early_stopping(LIGHTGBM_EARLY_STOPPING_ROUNDS, verbose=False)],
     )
 
-    raw_val_proba = classifier.predict_proba(X_val)[:, 1]
-    calibrator = PlattCalibrator.fit(raw_val_proba, y_val)
-    val_proba = calibrator.transform(raw_val_proba)
+    is_open = ~val[CLOSED_TOMORROW_COL].astype(bool).to_numpy()
+    raw_val_proba = classifier.predict_proba(X_val[is_open])[:, 1]
+    calibrator = PlattCalibrator.fit(raw_val_proba, y_val[is_open])
+    val_proba = visit_probabilities(
+        CalibratedTrack1Model(classifier=classifier, calibrator=calibrator), val
+    )
     cutoff_tuning = tune_chronic_cutoff(y_val, val_proba)
     model = CalibratedTrack1Model(
         classifier=classifier,
@@ -282,9 +294,8 @@ def tune_chronic_cutoff(y, proba) -> CutoffTuning:
 
 
 def _sum_p_check(model: CalibratedTrack1Model, test: pd.DataFrame) -> SumPCheck:
-    X_test, y_test, _ = _features_target_weight(test)
-    sum_p = float(model.predict_proba(X_test)[:, 1].sum())
-    actual_visits = int(y_test.sum())
+    sum_p = float(visit_probabilities(model, test).sum())
+    actual_visits = int(test[NEXT_DAY_VISIT_COL].sum())
     ratio = sum_p / actual_visits if actual_visits else float("nan")
     return SumPCheck(sum_p=sum_p, actual_visits=actual_visits, ratio=ratio)
 
@@ -305,6 +316,21 @@ def prepare_track1_features(mart1_rows: pd.DataFrame) -> pd.DataFrame:
     for col in CATEGORICAL_FEATURE_COLS:
         features[col] = features[col].astype("category")
     return features
+
+
+def visit_probabilities(model, mart1_rows: pd.DataFrame) -> np.ndarray:
+    """Each Mart 1 row's predicted visit probability: `model.predict_proba`'s
+    positive class on `prepare_track1_features`, except 0 for a row whose
+    target day the pharmacy is closed (내일_휴무) -- nobody can visit then,
+    so no model score should put them on the Visit List or into Track 1
+    demand (see CONTEXT.md "Pharmacy Calendar" and issue #39).
+
+    Shared by training (cutoff tuning, metrics and the Σp check) and Track 1
+    inference (`pipeline.inference`), so both see the same probabilities.
+    """
+    proba = model.predict_proba(prepare_track1_features(mart1_rows))[:, 1]
+    is_closed = mart1_rows[CLOSED_TOMORROW_COL].astype(bool).to_numpy()
+    return np.where(is_closed, 0.0, proba)
 
 
 def _features_target_weight(mart1_rows: pd.DataFrame) -> _Mart1Features:

@@ -3,6 +3,7 @@ import pandas as pd
 import pytest
 
 from conftest import (
+    closed_on,
     make_high_frequency_filler_visits,
     make_independent_chronic_match_visits,
     make_raw_visits,
@@ -731,3 +732,70 @@ def test_visit_list_is_passed_through_unchanged():
     )
 
     pd.testing.assert_frame_equal(result.visit_list, track1.visit_list)
+
+
+def test_nobody_is_expected_on_a_closed_target_day():
+    raw_visits = _two_chronic_customers_with_drug_consumption(
+        "2024-01-01", drug_id=501, consumption_1=40.0, consumption_2=20.0
+    )
+
+    result = run_track1_inference(
+        raw_visits,
+        as_of_date="2024-01-01",
+        model=StubModel([0.9, 0.9]),
+        chronic_visit_prob_cutoff=0.3,
+        pharmacy_calendar=closed_on("2024-01-02"),
+    )
+
+    assert result.scored_population[VISIT_PROB_COL].tolist() == [0.0, 0.0]
+    assert result.visit_list.empty
+    assert result.drug_demand[TRACK1_DEMAND_COL].sum() == 0.0
+
+
+def test_a_closed_target_day_gets_no_rare_drug_allocation():
+    # Drug 501 has two Chronic patients, under the rare-drug threshold.
+    raw_visits = _two_chronic_customers_with_drug_consumption(
+        "2024-01-01", drug_id=501, consumption_1=40.0, consumption_2=20.0
+    )
+
+    result = run_track1_inference(
+        raw_visits,
+        as_of_date="2024-01-01",
+        model=StubModel([0.9, 0.9]),
+        chronic_visit_prob_cutoff=0.3,
+        pharmacy_calendar=closed_on("2024-01-02"),
+    )
+
+    assert result.drug_demand[TRACK1_DEMAND_COL].sum() == 0.0
+
+
+def test_an_open_target_day_is_scored_as_usual_with_a_calendar():
+    raw_visits = _two_chronic_customers_with_drug_consumption(
+        "2024-01-01", drug_id=501, consumption_1=40.0, consumption_2=20.0
+    )
+
+    result = run_track1_inference(
+        raw_visits,
+        as_of_date="2024-01-01",
+        model=StubModel([0.9, 0.9]),
+        chronic_visit_prob_cutoff=0.3,
+        pharmacy_calendar=closed_on("2024-01-01"),
+    )
+
+    assert result.scored_population[VISIT_PROB_COL].tolist() == [0.9, 0.9]
+
+
+def test_daily_forecast_has_no_track1_demand_on_a_closed_target_day():
+    raw_visits = _two_chronic_customers_with_drug_consumption(
+        "2024-01-01", drug_id=501, consumption_1=40.0, consumption_2=20.0
+    )
+
+    result = run_daily_forecast(
+        raw_visits,
+        as_of_date="2024-01-01",
+        model=StubModel([0.9, 0.9]),
+        pharmacy_calendar=closed_on("2024-01-02"),
+    )
+
+    assert result.visit_list.empty
+    assert result.order_quantities[TRACK1_DEMAND_COL].sum() == 0.0

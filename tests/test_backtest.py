@@ -3,6 +3,7 @@ import pandas as pd
 import pytest
 
 from conftest import (
+    closed_on,
     make_high_frequency_filler_visits,
     make_independent_chronic_match_visits,
     make_raw_visits,
@@ -25,6 +26,7 @@ from pipeline.backtest import (
     run_backtest,
 )
 from pipeline.marts import (
+    CLOSED_TOMORROW_COL,
     DRUG_ID_COL,
     SNAPSHOT_DATE_COL,
     build_mart1_training_set,
@@ -411,3 +413,33 @@ def test_empty_test_dates_returns_empty_per_date_and_nan_track_wapes():
     assert list(result.per_date.columns) == BACKTEST_PER_DATE_COLUMNS
     assert np.isnan(result.summary.track1_wape)
     assert np.isnan(result.summary.track2_wape)
+
+
+def test_per_date_flags_closed_target_days_and_scores_them_zero():
+    raw_visits = make_raw_visits(_one_chronic_customer_on_drug_501())
+    calendar = closed_on("2024-01-14")
+
+    result = run_backtest(
+        raw_visits,
+        StubModel(0.5),
+        test_dates=["2024-01-13", "2024-01-14"],
+        chronic_visit_prob_cutoff=0.3,
+        pharmacy_calendar=calendar,
+    )
+
+    per_date = result.per_date.set_index(SNAPSHOT_DATE_COL)
+    assert per_date[CLOSED_TOMORROW_COL].tolist() == [True, False]
+    closed = per_date.loc[pd.Timestamp("2024-01-13")]
+    assert closed[SUM_VISIT_PROB_COL] == 0.0
+    assert closed[VISIT_LIST_SIZE_COL] == 0
+    assert per_date.loc[pd.Timestamp("2024-01-14"), SUM_VISIT_PROB_COL] == pytest.approx(0.5)
+    track1_predicted = result.daily.groupby(SNAPSHOT_DATE_COL)[TRACK1_PREDICTED_COL].sum()
+    assert track1_predicted.loc[pd.Timestamp("2024-01-13")] == 0.0
+
+
+def test_per_date_marks_no_day_closed_without_a_calendar():
+    raw_visits = make_raw_visits(_one_chronic_customer_on_drug_501())
+
+    result = run_backtest(raw_visits, StubModel(0.5), test_dates=["2024-01-13", "2024-01-14"])
+
+    assert not result.per_date[CLOSED_TOMORROW_COL].any()

@@ -32,6 +32,8 @@ from typing import NamedTuple
 import numpy as np
 import pandas as pd
 
+from .pharmacy_calendar import PharmacyCalendar
+
 CUSTOMER_ID_COL = "고객ID"
 VISIT_ID_COL = "조제판매ID"
 VISIT_DATE_COL = "내방일"
@@ -72,6 +74,11 @@ INGREDIENT_COL = "속명"
 # anchoring-visit features.
 MPR_COL = "복약_순응도"
 NO_SHOW_RATE_COL = "노쇼_비율"
+# Whether the pharmacy is closed on the target day (기준일자 + 1) and on the
+# snapshot day itself (see CONTEXT.md "Pharmacy Calendar" and issue #39):
+# nobody visits on a closed day, and the day after one picks up its visits.
+CLOSED_TOMORROW_COL = "내일_휴무"
+CLOSED_TODAY_COL = "오늘_휴무"
 MPR_NO_SHOW_FEATURE_COLS = [MPR_COL, NO_SHOW_RATE_COL]
 
 # Severity/특례 eligibility flags (see CONTEXT.md "Severe/특례 Weight Tier").
@@ -112,6 +119,8 @@ MART1_COLUMNS = [
     INSURANCE_TYPE_COL,
     NEAR_POVERTY_COL,
     *MPR_NO_SHOW_FEATURE_COLS,
+    CLOSED_TOMORROW_COL,
+    CLOSED_TODAY_COL,
     WEIGHT_COL,
 ]
 # MART1_COLUMNS entries that are an identifier, the Y label, the sample
@@ -132,7 +141,12 @@ MART1_NUMERIC_FEATURE_COLS = [
     LONG_TERM_MED_DAYS_COL,
     *MPR_NO_SHOW_FEATURE_COLS,
 ]
-MART1_BOOLEAN_FEATURE_COLS = [TOMORROW_IS_EXPECTED_VISIT_COL, NEAR_POVERTY_COL]
+MART1_BOOLEAN_FEATURE_COLS = [
+    TOMORROW_IS_EXPECTED_VISIT_COL,
+    NEAR_POVERTY_COL,
+    CLOSED_TOMORROW_COL,
+    CLOSED_TODAY_COL,
+]
 
 MART2_COLUMNS = [CUSTOMER_ID_COL, DRUG_ID_COL, MART2_VALUE_COL]
 SEASON_COL = "계절"
@@ -293,6 +307,7 @@ def build_marts(
     mart3_season_min_days: int = MART3_SEASON_MIN_DAYS,
     rare_drug_patient_threshold: int = RARE_DRUG_PATIENT_THRESHOLD,
     lapse_horizon_days: int = LAPSE_HORIZON_DAYS,
+    pharmacy_calendar: PharmacyCalendar | None = None,
 ) -> MartResult:
     """Build Mart 1/2/3 from raw visit-level rows, as of a given snapshot date.
 
@@ -324,11 +339,15 @@ def build_marts(
     drops Lapsed Chronic customers -- latest visit more than that many days
     before `as_of_date` -- from Mart 1 only; they stay Chronic, so Mart 3
     still excludes their visits from their Chronic-since Date on.
+    `pharmacy_calendar` sets Mart 1's 내일_휴무/오늘_휴무 (see
+    `_closed_day_features`); without one, no day is closed.
     """
     as_of_date = pd.Timestamp(as_of_date)
     chronic_since = chronic_since_dates(raw_visits)
     chronic_customer_ids = _chronic_customer_ids_as_of(chronic_since, as_of_date)
-    mart1 = _build_mart1(raw_visits, as_of_date, chronic_customer_ids, lapse_horizon_days)
+    mart1 = _build_mart1(
+        raw_visits, as_of_date, chronic_customer_ids, lapse_horizon_days, pharmacy_calendar
+    )
     mart2 = _build_mart2(raw_visits, as_of_date)
     mart3 = _build_mart3(
         raw_visits,
@@ -342,7 +361,9 @@ def build_marts(
 
 
 def build_mart1_training_set(
-    raw_visits: pd.DataFrame, lapse_horizon_days: int = LAPSE_HORIZON_DAYS
+    raw_visits: pd.DataFrame,
+    lapse_horizon_days: int = LAPSE_HORIZON_DAYS,
+    pharmacy_calendar: PharmacyCalendar | None = None,
 ) -> pd.DataFrame:
     """Mart 1's full historical training set: one row per Next-Day Visit
     positive (see `_mart1_positive_samples`) plus one row per
@@ -401,7 +422,9 @@ def build_mart1_training_set(
     samples = samples[is_chronic_as_of_row & is_labelled].reset_index(drop=True)
 
     result = samples.join(
-        _mart1_x_features(raw_visits, samples[CUSTOMER_ID_COL], samples[SNAPSHOT_DATE_COL])
+        _mart1_x_features(
+            raw_visits, samples[CUSTOMER_ID_COL], samples[SNAPSHOT_DATE_COL], pharmacy_calendar
+        )
     )
     result = result[_is_within_lapse_horizon(result, lapse_horizon_days)].reset_index(drop=True)
     # Derived solely from Revisit Match, same as _build_mart1 -- every row
@@ -450,6 +473,7 @@ def split_mart1_training_set(
     test_months: int = TEST_WINDOW_MONTHS,
     val_months: int = VAL_WINDOW_MONTHS,
     lapse_horizon_days: int = LAPSE_HORIZON_DAYS,
+    pharmacy_calendar: PharmacyCalendar | None = None,
 ) -> Mart1Split:
     """Splits Mart 1 into train/val/test over `mart1_split_windows`'s
     windows. Only train is drawn from `training_set`
@@ -473,7 +497,7 @@ def split_mart1_training_set(
     train = training_set[training_set[SNAPSHOT_DATE_COL] < windows.val_start]
     # One pass over both eval windows, sliced afterwards.
     snapshots = build_mart1_daily_snapshots(
-        raw_visits, windows.val_start, windows.end, lapse_horizon_days
+        raw_visits, windows.val_start, windows.end, lapse_horizon_days, pharmacy_calendar
     )
     is_test = snapshots[SNAPSHOT_DATE_COL] >= windows.test_start
     val = snapshots[~is_test].reset_index(drop=True)
@@ -482,7 +506,11 @@ def split_mart1_training_set(
 
 
 def build_mart1_daily_snapshots(
-    raw_visits: pd.DataFrame, start, end, lapse_horizon_days: int = LAPSE_HORIZON_DAYS
+    raw_visits: pd.DataFrame,
+    start,
+    end,
+    lapse_horizon_days: int = LAPSE_HORIZON_DAYS,
+    pharmacy_calendar: PharmacyCalendar | None = None,
 ) -> pd.DataFrame:
     """Mart 1's full daily snapshots for every day from `start` to `end`
     (inclusive): the rows `build_marts(raw_visits, day).mart1` would hold
@@ -532,7 +560,11 @@ def build_mart1_daily_snapshots(
         [rows[CUSTOMER_ID_COL], rows[SNAPSHOT_DATE_COL] + pd.Timedelta(days=1)]
     ).isin(visited)
     rows[CHRONIC_COL] = True
-    rows = rows.join(_mart1_x_features(raw_visits, rows[CUSTOMER_ID_COL], rows[SNAPSHOT_DATE_COL]))
+    rows = rows.join(
+        _mart1_x_features(
+            raw_visits, rows[CUSTOMER_ID_COL], rows[SNAPSHOT_DATE_COL], pharmacy_calendar
+        )
+    )
     rows = rows[_is_within_lapse_horizon(rows, lapse_horizon_days)].reset_index(drop=True)
 
     # As-of-correct, as `build_marts` gives it (`sample_mart1_weights` over
@@ -1024,6 +1056,7 @@ def _build_mart1(
     as_of_date: pd.Timestamp,
     chronic_customer_ids: set,
     lapse_horizon_days: int = LAPSE_HORIZON_DAYS,
+    pharmacy_calendar: PharmacyCalendar | None = None,
 ) -> pd.DataFrame:
     # Only Chronic Patients (per Revisit Match) belong to Mart 1; Acute
     # patients' visits are excluded here and become part of Mart 3's
@@ -1054,7 +1087,12 @@ def _build_mart1(
         }
     )
     mart1 = mart1.join(
-        _mart1_x_features(raw_visits, customers, pd.Series(as_of_date, index=customers.index))
+        _mart1_x_features(
+            raw_visits,
+            customers,
+            pd.Series(as_of_date, index=customers.index),
+            pharmacy_calendar,
+        )
     )
     mart1 = mart1[_is_within_lapse_horizon(mart1, lapse_horizon_days)].reset_index(drop=True)
     mart1 = _attach_mart1_weight(
@@ -1073,7 +1111,10 @@ def _is_within_lapse_horizon(mart1_rows: pd.DataFrame, lapse_horizon_days: int) 
 
 
 def _mart1_x_features(
-    raw_visits: pd.DataFrame, customer_ids: pd.Series, snapshot_dates: pd.Series
+    raw_visits: pd.DataFrame,
+    customer_ids: pd.Series,
+    snapshot_dates: pd.Series,
+    pharmacy_calendar: PharmacyCalendar | None = None,
 ) -> pd.DataFrame:
     """Mart 1's X-features (see issue #7/#8) for each (고객ID, snapshot date)
     pair -- `customer_ids` and `snapshot_dates` are aligned Series, and the
@@ -1081,7 +1122,8 @@ def _mart1_x_features(
     its own row's snapshot date (see docs/adr/0002-point-in-time-correctness.md):
     demographics, as-of family loyalty, visit-timing/medication and
     insurance/차상위 features anchored to the customer's most recent visit at
-    or before that date, and the MPR/no-show history aggregates.
+    or before that date, the MPR/no-show history aggregates, and
+    `_closed_day_features` from `pharmacy_calendar`.
 
     One vectorized pass regardless of how many distinct snapshot dates the
     rows span, so `build_marts` (one date) and `build_mart1_training_set`
@@ -1122,12 +1164,30 @@ def _mart1_x_features(
     features = features.join(_anchoring_visit_features(history, start, end, snapshot_dates))
     features = features.join(_mpr_as_of(history, start, end, customer_ids.index))
     features[NO_SHOW_RATE_COL] = _no_show_rate_as_of(history, customer_ids, snapshot_dates)
+    features = features.join(_closed_day_features(snapshot_dates, pharmacy_calendar))
 
     for col in MART1_NUMERIC_FEATURE_COLS:
         features[col] = features[col].astype(float)
     for col in MART1_BOOLEAN_FEATURE_COLS:
         features[col] = features[col].astype("boolean")
     return features
+
+
+def _closed_day_features(
+    snapshot_dates: pd.Series, pharmacy_calendar: PharmacyCalendar | None
+) -> pd.DataFrame:
+    """내일_휴무/오늘_휴무 per row: whether `pharmacy_calendar` has the
+    pharmacy closed on the row's target day (snapshot date + 1) and on the
+    snapshot date itself. A closure is planned in advance, so the calendar
+    is read as it stands, never as of the snapshot date (see
+    `pipeline.pharmacy_calendar`). No calendar means no day is closed."""
+    calendar = pharmacy_calendar or PharmacyCalendar.always_open()
+    return pd.DataFrame(
+        {
+            CLOSED_TOMORROW_COL: calendar.is_closed(snapshot_dates + pd.Timedelta(days=1)),
+            CLOSED_TODAY_COL: calendar.is_closed(snapshot_dates),
+        }
+    )
 
 
 def _visit_table(raw_visits: pd.DataFrame) -> pd.DataFrame:

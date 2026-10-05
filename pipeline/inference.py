@@ -41,7 +41,8 @@ from .marts import (
     current_regimen,
     season_and_weekday_for,
 )
-from .model import prepare_track1_features, resolve_chronic_cutoff
+from .model import resolve_chronic_cutoff, visit_probabilities
+from .pharmacy_calendar import PharmacyCalendar
 
 # Track 1 inference's own output columns (see CONTEXT.md "Visit List").
 VISIT_PROB_COL = "예측방문확률"
@@ -92,6 +93,7 @@ def run_track1_inference(
     chronic_visit_prob_cutoff: float | None = None,
     rare_drug_patient_threshold: int = RARE_DRUG_PATIENT_THRESHOLD,
     lapse_horizon_days: int = LAPSE_HORIZON_DAYS,
+    pharmacy_calendar: PharmacyCalendar | None = None,
 ) -> Track1Result:
     """Scores every Chronic customer in `build_marts`'s Mart 1 snapshot for
     `as_of_date` and returns the pharmacist Visit List alongside Track 1's
@@ -133,10 +135,19 @@ def run_track1_inference(
     `chronic_visit_prob_cutoff` defaults to the model's own tuned cutoff
     (`pipeline.model.resolve_chronic_cutoff`), falling back to
     `CHRONIC_VISIT_PROB_CUTOFF` for a model that carries none.
+
+    `pharmacy_calendar` is forwarded to `build_marts` for Mart 1's
+    closed-day features. When it has the pharmacy closed on the target date
+    (`as_of_date + 1 day`), every customer's probability is 0: an empty
+    Visit List and no Track 1 demand, rare drugs included (see CONTEXT.md
+    "Pharmacy Calendar"). Without one, no day is closed.
     """
     as_of_date = pd.Timestamp(as_of_date)
     mart1, mart2, _mart3 = build_marts(
-        raw_visits, as_of_date, lapse_horizon_days=lapse_horizon_days
+        raw_visits,
+        as_of_date,
+        lapse_horizon_days=lapse_horizon_days,
+        pharmacy_calendar=pharmacy_calendar,
     )
     return _track1_from_marts(
         mart1,
@@ -182,10 +193,10 @@ def _track1_from_marts(
 
 
 def _score_mart1(mart1: pd.DataFrame, model) -> pd.Series:
-    """Predicted visit probability per Mart 1 row (positive-class column of
-    `model.predict_proba`), indexed the same as `mart1` itself."""
-    features = prepare_track1_features(mart1)
-    return pd.Series(model.predict_proba(features)[:, 1], index=mart1.index)
+    """Predicted visit probability per Mart 1 row
+    (`pipeline.model.visit_probabilities`: 0 on a closed target day),
+    indexed the same as `mart1` itself."""
+    return pd.Series(visit_probabilities(model, mart1), index=mart1.index)
 
 
 def _build_scored_population(
@@ -286,6 +297,7 @@ def run_daily_forecast(
     mart3_season_min_days: int = MART3_SEASON_MIN_DAYS,
     rare_drug_patient_threshold: int = RARE_DRUG_PATIENT_THRESHOLD,
     lapse_horizon_days: int = LAPSE_HORIZON_DAYS,
+    pharmacy_calendar: PharmacyCalendar | None = None,
 ) -> ForecastResult:
     """The full daily forecast: Track 1's Visit List and per-drug demand
     (`run_track1_inference`) combined with Track 2's estimate (Mart 3's
@@ -303,7 +315,9 @@ def run_daily_forecast(
     `lapse_horizon_days` is forwarded to `build_marts` and only narrows
     Track 1's Mart 1 population (see `run_track1_inference`).
     `chronic_visit_prob_cutoff` defaults to the model's own tuned cutoff, as
-    in `run_track1_inference`.
+    in `run_track1_inference`. `pharmacy_calendar` zeroes Track 1 on a
+    closed target date, as in `run_track1_inference`; Track 2 doesn't read
+    it.
 
     `order_quantities` (`ORDER_QUANTITY_COLUMNS`: 기준일자, 약품ID, 약품명,
     track1_기댓값, track2_통계값, 최종발주량, 희귀약_최소재고) is the union of
@@ -326,6 +340,7 @@ def run_daily_forecast(
         mart3_season_min_days=mart3_season_min_days,
         rare_drug_patient_threshold=rare_drug_patient_threshold,
         lapse_horizon_days=lapse_horizon_days,
+        pharmacy_calendar=pharmacy_calendar,
     )
     track1 = _track1_from_marts(
         mart1,

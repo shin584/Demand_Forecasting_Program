@@ -5,6 +5,8 @@ import pytest
 from pipeline.marts import (
     AGE_COL,
     CHRONIC_COL,
+    CLOSED_TODAY_COL,
+    CLOSED_TOMORROW_COL,
     CUSTOMER_ID_COL,
     DAYS_SINCE_LAST_VISIT_COL,
     FAMILY_VISIT_COUNT_COL,
@@ -30,6 +32,7 @@ from pipeline.model import (
     save_track1_model,
     train_track1_model,
     tune_chronic_cutoff,
+    visit_probabilities,
 )
 
 
@@ -64,6 +67,8 @@ def _make_mart1_training_frame(n: int, seed: int) -> pd.DataFrame:
             NEAR_POVERTY_COL: rng.choice([True, False], size=n),
             MPR_COL: rng.uniform(0, 100, size=n),
             NO_SHOW_RATE_COL: rng.uniform(0, 1, size=n),
+            CLOSED_TOMORROW_COL: False,
+            CLOSED_TODAY_COL: False,
             WEIGHT_COL: 1.0,
         }
     )
@@ -273,6 +278,8 @@ def _fixed_feature_vector() -> dict:
         NEAR_POVERTY_COL: False,
         MPR_COL: 80.0,
         NO_SHOW_RATE_COL: 0.1,
+        CLOSED_TOMORROW_COL: False,
+        CLOSED_TODAY_COL: False,
     }
 
 
@@ -336,3 +343,66 @@ def test_model_persists_and_reloads_to_an_equivalent_usable_model(tmp_path):
     original_proba = result.model.predict_proba(X_val)[:, 1]
     reloaded_proba = reloaded.predict_proba(X_val)[:, 1]
     np.testing.assert_allclose(original_proba, reloaded_proba)
+
+
+class _FixedScoreModel:
+    def __init__(self, score: float):
+        self._score = score
+
+    def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
+        scores = np.full(len(X), self._score)
+        return np.column_stack([1 - scores, scores])
+
+
+def test_visit_probability_is_zero_on_a_closed_target_day():
+    rows = _make_mart1_training_frame(4, seed=1)
+    rows[CLOSED_TOMORROW_COL] = [False, True, False, True]
+
+    proba = visit_probabilities(_FixedScoreModel(0.3), rows)
+
+    np.testing.assert_allclose(proba, [0.3, 0.0, 0.3, 0.0])
+
+
+def test_a_closed_snapshot_day_alone_does_not_zero_the_probability():
+    rows = _make_mart1_training_frame(2, seed=1)
+    rows[CLOSED_TODAY_COL] = True
+
+    np.testing.assert_allclose(visit_probabilities(_FixedScoreModel(0.3), rows), [0.3, 0.3])
+
+
+def _with_closed_target_days(frame: pd.DataFrame, n_closed: int, seed: int) -> pd.DataFrame:
+    """`frame` plus `n_closed` rows like its own but on a closed target day,
+    where nobody visits."""
+    closed = _make_mart1_training_frame(n_closed, seed)
+    closed[CLOSED_TOMORROW_COL] = True
+    closed[NEXT_DAY_VISIT_COL] = False
+    return pd.concat([frame, closed], ignore_index=True)
+
+
+def test_calibration_matches_the_open_day_visit_rate():
+    # A third of validation falls on closed target days with no visits.
+    # Those rows get p = 0 anyway, so calibrating on them would only drag
+    # the open days' probabilities down below their real visit rate.
+    train = _make_mart1_training_frame(600, seed=1)
+    open_val = _noisy_frame(2000, seed=2, due_visit_rate=0.2)
+    val = _with_closed_target_days(open_val, 1000, seed=4)
+
+    result = train_track1_model(train, val)
+
+    open_mean = result.model.predict_proba(prepare_track1_features(open_val))[:, 1].mean()
+    assert open_mean == pytest.approx(open_val[NEXT_DAY_VISIT_COL].mean(), abs=0.01)
+
+
+def test_closed_target_days_add_nothing_to_validation_metrics_or_test_sum_p():
+    train = _make_mart1_training_frame(600, seed=1)
+    val = _with_closed_target_days(_noisy_frame(2000, seed=2, due_visit_rate=0.2), 1000, seed=4)
+    open_test = _noisy_frame(2000, seed=3, due_visit_rate=0.2)
+    test = _with_closed_target_days(open_test, 1000, seed=5)
+
+    result = train_track1_model(train, val, test)
+
+    val_proba = visit_probabilities(result.model, val)
+    assert result.metrics["mean_p"] == pytest.approx(val_proba.mean())
+    assert result.cutoff_tuning == tune_chronic_cutoff(val[NEXT_DAY_VISIT_COL], val_proba)
+    open_sum_p = result.model.predict_proba(prepare_track1_features(open_test))[:, 1].sum()
+    assert result.sum_p_check.sum_p == pytest.approx(open_sum_p)

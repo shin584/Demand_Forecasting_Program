@@ -23,6 +23,7 @@ from .inference import (
     run_daily_forecast,
 )
 from .marts import (
+    CLOSED_TOMORROW_COL,
     CONSUMPTION_COL,
     CUSTOMER_ID_COL,
     DRUG_ID_COL,
@@ -31,6 +32,7 @@ from .marts import (
     build_mart1_training_set,
     mart1_split_windows,
 )
+from .pharmacy_calendar import PharmacyCalendar
 
 # This module's own output columns.
 PREDICTED_COL = "예측수요"
@@ -70,6 +72,9 @@ BACKTEST_PER_DATE_COLUMNS = [
     ACTUAL_CHRONIC_VISITS_COL,
     VISIT_LIST_SIZE_COL,
     SCORED_POPULATION_SIZE_COL,
+    # Mart 1's own 내일_휴무: whether the target date is closed, so open- and
+    # closed-day figures can be reported apart (see issue #39).
+    CLOSED_TOMORROW_COL,
 ]
 
 
@@ -97,6 +102,7 @@ def run_backtest(
     model,
     test_dates=None,
     chronic_visit_prob_cutoff: float | None = None,
+    pharmacy_calendar: PharmacyCalendar | None = None,
 ) -> BacktestResult:
     """Walks `run_daily_forecast(raw_visits, as_of_date, model)` forward one
     calendar day at a time across `test_dates`, comparing each day's
@@ -111,7 +117,8 @@ def run_backtest(
     `pipeline.model.train_track1_model`), so its probabilities are whatever
     `model.predict_proba` gives -- calibrated, for a `CalibratedTrack1Model`.
     `chronic_visit_prob_cutoff` is forwarded to `run_daily_forecast`; left
-    unset, that uses the model's own tuned cutoff.
+    unset, that uses the model's own tuned cutoff. So is
+    `pharmacy_calendar`, which zeroes Track 1 on closed target dates.
 
     Returns a `BacktestResult`:
 
@@ -124,7 +131,8 @@ def run_backtest(
     - `per_date` (`BACKTEST_PER_DATE_COLUMNS`, one row per as-of-date): the
       sum of Track 1 visit probabilities, how many scored customers actually
       visited on the target date, the Visit List size and the scored
-      population size.
+      population size, and whether `pharmacy_calendar` has the target date
+      closed (내일_휴무).
     - `summary`: overall WAPE across every row in `daily`, total
       predicted/actual volume for context, and a WAPE per track (each
       track's predicted against its own actual).
@@ -142,7 +150,9 @@ def run_backtest(
         test_dates = _default_test_dates(raw_visits)
 
     days = [
-        _backtest_one_day(raw_visits, as_of_date, model, chronic_visit_prob_cutoff)
+        _backtest_one_day(
+            raw_visits, as_of_date, model, chronic_visit_prob_cutoff, pharmacy_calendar
+        )
         for as_of_date in test_dates
     ]
     if days:
@@ -168,6 +178,7 @@ def _empty_per_date() -> pd.DataFrame:
     per_date[SUM_VISIT_PROB_COL] = per_date[SUM_VISIT_PROB_COL].astype(float)
     for col in (ACTUAL_CHRONIC_VISITS_COL, VISIT_LIST_SIZE_COL, SCORED_POPULATION_SIZE_COL):
         per_date[col] = per_date[col].astype(int)
+    per_date[CLOSED_TOMORROW_COL] = per_date[CLOSED_TOMORROW_COL].astype(bool)
     return per_date
 
 
@@ -179,14 +190,24 @@ def _default_test_dates(raw_visits: pd.DataFrame) -> pd.DatetimeIndex:
 
 
 def _backtest_one_day(
-    raw_visits: pd.DataFrame, as_of_date, model, chronic_visit_prob_cutoff: float | None
+    raw_visits: pd.DataFrame,
+    as_of_date,
+    model,
+    chronic_visit_prob_cutoff: float | None,
+    pharmacy_calendar: PharmacyCalendar | None,
 ) -> _BacktestDay:
     as_of_date = pd.Timestamp(as_of_date)
+    target_date = as_of_date + pd.Timedelta(days=1)
+    calendar = pharmacy_calendar or PharmacyCalendar.always_open()
     forecast = run_daily_forecast(
-        raw_visits, as_of_date, model, chronic_visit_prob_cutoff=chronic_visit_prob_cutoff
+        raw_visits,
+        as_of_date,
+        model,
+        chronic_visit_prob_cutoff=chronic_visit_prob_cutoff,
+        pharmacy_calendar=pharmacy_calendar,
     )
     scored_customer_ids = set(forecast.scored_population[CUSTOMER_ID_COL])
-    target_visits = _visits_on(raw_visits, as_of_date + pd.Timedelta(days=1))
+    target_visits = _visits_on(raw_visits, target_date)
 
     daily = _daily_per_drug(forecast.order_quantities, target_visits, scored_customer_ids)
     daily.insert(0, SNAPSHOT_DATE_COL, as_of_date)
@@ -199,6 +220,7 @@ def _backtest_one_day(
             ACTUAL_CHRONIC_VISITS_COL: [len(scored_customer_ids & visited_customer_ids)],
             VISIT_LIST_SIZE_COL: [len(forecast.visit_list)],
             SCORED_POPULATION_SIZE_COL: [len(scored_customer_ids)],
+            CLOSED_TOMORROW_COL: [bool(calendar.is_closed(pd.Series([target_date])).iloc[0])],
         }
     )
     return _BacktestDay(daily=daily[BACKTEST_DAILY_COLUMNS], per_date=per_date)

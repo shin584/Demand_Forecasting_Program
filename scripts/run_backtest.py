@@ -9,7 +9,11 @@ training path, see `pipeline.model.train_track1_model`) -- reports the test
 window's Σp against actual Chronic next-day visits, then walks the trained
 model forward across the split's test window at the cutoff it carries (the
 tuned, F1-maximising one, or the default `CHRONIC_VISIT_PROB_CUTOFF` if none
-could be tuned). A full run walks one calendar day at a time across the
+could be tuned). Closed days come from the extract itself
+(`PharmacyCalendar.from_visits`: a day with no dispensing is closed), and
+the report splits Track 1's figures by whether the target day was closed,
+the first open day after a closure, or any other open day (issue #39). A
+full run walks one calendar day at a time across the
 whole test window (6 months by default), rebuilding Mart 1/2/3 as of each
 day -- a few seconds per day on the v0.3 extract; pass a narrower
 `--test-dates-limit` while iterating.
@@ -29,16 +33,20 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from pipeline.backtest import (
+    ACTUAL_CHRONIC_VISITS_COL,
     ACTUAL_COL,
     ERROR_COL,
     PREDICTED_COL,
+    SUM_VISIT_PROB_COL,
     TRACK1_ACTUAL_COL,
     TRACK1_PREDICTED_COL,
     TRACK2_ACTUAL_COL,
     TRACK2_PREDICTED_COL,
+    VISIT_LIST_SIZE_COL,
     run_backtest,
 )
 from pipeline.marts import (
+    CLOSED_TOMORROW_COL,
     DRUG_ID_COL,
     SNAPSHOT_DATE_COL,
     build_mart1_training_set,
@@ -46,6 +54,7 @@ from pipeline.marts import (
     split_mart1_training_set,
 )
 from pipeline.model import CHRONIC_VISIT_PROB_CUTOFF, train_track1_model
+from pipeline.pharmacy_calendar import PharmacyCalendar
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 RAW_DATA_PATH = REPO_ROOT / "dataset" / "pharmacy_raw_data_v0.3.csv"
@@ -89,6 +98,40 @@ def _visit_probability_table(per_date: pd.DataFrame) -> pd.DataFrame:
     return table.astype(dtypes)
 
 
+def _target_day_kind_table(result, calendar: PharmacyCalendar) -> pd.DataFrame:
+    """Track 1's figures per kind of target day (see issue #39): closed, the
+    first open day after a closure (the as-of date itself was closed), and
+    every other open day -- Σp, actual Chronic next-day visits, mean Visit
+    List size, and Track 1's predicted/actual volume and WAPE."""
+    per_date = result.per_date.set_index(SNAPSHOT_DATE_COL)
+    kind = pd.Series("open", index=per_date.index)
+    kind[calendar.is_closed(per_date.index.to_series()).to_numpy()] = "open, after a closure"
+    kind[per_date[CLOSED_TOMORROW_COL].to_numpy()] = "closed"
+
+    daily = result.daily.assign(
+        _error=(result.daily[TRACK1_PREDICTED_COL] - result.daily[TRACK1_ACTUAL_COL]).abs()
+    )
+    track1 = daily.groupby(SNAPSHOT_DATE_COL)[
+        [TRACK1_PREDICTED_COL, TRACK1_ACTUAL_COL, "_error"]
+    ].sum()
+    table = (
+        per_date.join(track1)
+        .assign(kind=kind)
+        .groupby("kind")
+        .agg(
+            days=(SUM_VISIT_PROB_COL, "size"),
+            sum_p=(SUM_VISIT_PROB_COL, "sum"),
+            actual_visits=(ACTUAL_CHRONIC_VISITS_COL, "sum"),
+            mean_visit_list=(VISIT_LIST_SIZE_COL, "mean"),
+            track1_predicted=(TRACK1_PREDICTED_COL, "sum"),
+            track1_actual=(TRACK1_ACTUAL_COL, "sum"),
+            _error=("_error", "sum"),
+        )
+    )
+    table["track1_WAPE"] = table["_error"] / table["track1_actual"].replace(0, pd.NA)
+    return table.drop(columns="_error")
+
+
 def _training_summary(trained) -> str:
     tuning = trained.cutoff_tuning
     if tuning.cutoff is None:
@@ -111,7 +154,9 @@ def _training_summary(trained) -> str:
     )
 
 
-def _write_report(path: Path, result, training_summary: str) -> None:
+def _write_report(
+    path: Path, result, training_summary: str, calendar: PharmacyCalendar
+) -> None:
     summary = result.summary
     wape_by_date = _wape_breakdown(result.daily, SNAPSHOT_DATE_COL)
     per_drug = _wape_breakdown(result.daily, DRUG_ID_COL).sort_values(ERROR_COL, ascending=False)
@@ -127,6 +172,9 @@ def _write_report(path: Path, result, training_summary: str) -> None:
         f.write(f"Total predicted: {summary.total_predicted:.2f}\n")
         f.write(f"Total actual: {summary.total_actual:.2f}\n")
         f.write(f"Days: {len(result.per_date)}\n\n")
+        f.write("Track 1 by target day:\n")
+        f.write(_target_day_kind_table(result, calendar).to_string())
+        f.write("\n\n")
         f.write(
             "Track 1 visit probabilities per as-of-date (Σp vs actual Chronic next-day "
             "visits; Visit List size vs scored Chronic population):\n"
@@ -150,10 +198,11 @@ def main() -> None:
     args = parser.parse_args()
 
     raw_visits = _load_raw_visits(RAW_DATA_PATH)
+    calendar = PharmacyCalendar.from_visits(raw_visits)
 
-    training_set = build_mart1_training_set(raw_visits)
+    training_set = build_mart1_training_set(raw_visits, pharmacy_calendar=calendar)
     started = time.perf_counter()
-    split = split_mart1_training_set(training_set, raw_visits)
+    split = split_mart1_training_set(training_set, raw_visits, pharmacy_calendar=calendar)
     print(
         f"Built val/test daily snapshots in {time.perf_counter() - started:.1f}s "
         f"({len(split.val):,} val rows, {len(split.test):,} test rows)"
@@ -168,8 +217,11 @@ def main() -> None:
         full_range = pd.date_range(windows.test_start, windows.end, freq="D")
         test_dates = list(full_range[: args.test_dates_limit])
 
-    result = run_backtest(raw_visits, trained.model, test_dates=test_dates)
-    _write_report(REPORT_PATH, result, training_summary)
+    result = run_backtest(
+        raw_visits, trained.model, test_dates=test_dates, pharmacy_calendar=calendar
+    )
+    _write_report(REPORT_PATH, result, training_summary, calendar)
+    print(_target_day_kind_table(result, calendar).to_string())
 
     print(
         f"WAPE: {result.summary.wape:.4f} (Track 1 {result.summary.track1_wape:.4f}, "
