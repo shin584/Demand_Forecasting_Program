@@ -25,3 +25,27 @@ Track 1's X-features had no notion of whether the target day is open. In the ful
 - *Reallocating a closed day's probability onto the next open day*: rejected. 오늘_휴무 lets the model learn the pile-up from data instead of a hand-written rule.
 
 **Consequences**: Saved models from before this change lack the two features and must be retrained. Track 2 doesn't read the calendar: a closed Sunday already forecasts 0 through its weekday bucket, but holidays don't. Zeroing Track 2 (and the order) on closed target days is a separate decision. A low-volume holiday opening (2–8 visits, e.g. 2025-12-25) counts as open and is scored like any other day.
+
+**Result (full v0.3 backtest, 185 as-of dates, 2025-07-15 → 2026-01-15)**: the model was retrained with the two features. The calendar inferred 27 closed target days in the window.
+
+| | before | after |
+|---|---|---|
+| Combined WAPE | 1.115 | 0.968 |
+| Track 1 WAPE | 1.191 | 1.030 |
+| Track 1 predicted (actual 614,332) | 679,019 | 645,677 |
+| Test-window Σp (actual 6,478) | 6,737 (1.04×) | 6,915 (1.07×) |
+| Tuned cutoff | 0.108 | 0.160 |
+| Validation precision / recall / F1 | 0.17 / 0.35 / 0.23 | 0.25 / 0.28 / 0.27 |
+| Validation AUC | 0.846 | 0.874 |
+
+The AUC and precision gains are partly mechanical: validation now includes closed days, which have p = 0 and Y = 0.
+
+By target day, after:
+
+| target day | days | Σp | actual visits | ratio | Visit List / day | Track 1 WAPE |
+|---|---|---|---|---|---|---|
+| closed | 27 | 0 | 0 | — | 0 | — (no actual) |
+| first open day after a closure | 27 | 1,153 | 1,412 | 0.82× | 51 | 0.83 |
+| other open | 131 | 5,762 | 5,066 | 1.14× | 51 | 1.09 |
+
+Closed-day over-forecast is gone, and the Visit List shrinks from ~71 to ~51 a day. 오늘_휴무 only partly captures the pile-up: the first open day after a closure is still under-predicted (0.82×), while ordinary open days are now over-predicted (1.14×). Calibration fits one sigmoid across both, so a residual remains for a later issue.
