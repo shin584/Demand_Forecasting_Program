@@ -321,7 +321,9 @@ def run_daily_forecast(
     demand too, so 최종발주량 is 0 for every drug; 희귀약_최소재고 is kept,
     being a stock level rather than daily flow. Closed-day demand isn't
     rolled forward onto the next open day (see CONTEXT.md "Pharmacy
-    Calendar").
+    Calendar"). It also keeps closed days out of Mart 3's day counts, so
+    Track 2's open-day values aren't diluted by them (see
+    `resolve_mart3_backoff`).
 
     `order_quantities` (`ORDER_QUANTITY_COLUMNS`: 기준일자, 약품ID, 약품명,
     track1_기댓값, track2_통계값, 최종발주량, 희귀약_최소재고) is the union of

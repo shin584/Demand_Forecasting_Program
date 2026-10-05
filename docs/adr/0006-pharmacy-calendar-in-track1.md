@@ -64,3 +64,18 @@ Full v0.3 backtest, same 185 as-of dates and same retrained Track 1 model as abo
 | Track 2 on open target days: predicted / actual / WAPE | 70,759 / 86,764 / 1.210 | 70,759 / 86,764 / 1.210 |
 
 The whole gain is the removed closed-day forecast (about 61 units per closed day, from holidays and young drugs' backed-off Sundays); open days are unchanged, as intended. Track 2 still under-forecasts open days (0.82×), so the ~2% per-weekday dilution from closed days in Mart 3's denominators is small next to Track 2's remaining error, and is left as deferred.
+
+**Update (issue #41): closed days out of Mart 3's day counts.** The deferred decision is now made. Mart 3 leaves days the calendar has closed out of every day count: bucket, season and overall tiers, and with them the `N_bucket`/`N_season` sufficiency checks. A value is now expected consumption per open day. A closed day with a dispensing (a listed closure the pharmacy opened on anyway) counts as open, so a drug's consumption and its days always cover the same dates. Sunday buckets now have almost no open days and back off to their season's open-day rate. Only an open Sunday ever uses that rate, since #42's override forecasts a closed target day as 0. See ADR-0003's update for the trade-off.
+
+Full v0.3 backtest, same 185 as-of dates and same retrained Track 1 model as #42 (cutoff 0.160, 27 closed target days):
+
+| | before (#42) | after |
+|---|---|---|
+| Combined WAPE | 0.966 | 0.968 |
+| Track 1 WAPE | 1.030 | 1.030 |
+| Track 2 WAPE | 1.210 | 1.238 |
+| Track 2 predicted (actual 86,764) | 70,759 (0.82×) | 75,459 (0.87×) |
+| Track 2 predicted on closed target days | 0 | 0 |
+| Track 2 on open target days: predicted / actual / WAPE | 70,759 / 86,764 / 1.210 | 75,459 / 86,764 / 1.238 |
+
+Only two Sundays in the test window were open (2025-10-05 and 2025-10-26), so the shift comes from weekday rates: no longer diluted by holidays, and, for backed-off drugs, by closed Sundays pooled into the season and overall tiers.

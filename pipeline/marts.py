@@ -96,7 +96,7 @@ _SEASON_SUM_COL = "_season_sum"
 _SEASON_DAYS_COL = "_season_days"
 _DRUG_SUM_COL = "_drug_sum"
 _DRUG_DAYS_COL = "_drug_days"
-_CALENDAR_DAY_COL = "_calendar_day"
+_OPEN_DAY_COL = "_open_day"
 _MATCHED_ON_COL = "_matched_on"
 
 # 가족_총매출 (as-of) is permanently out of scope, not merely deferred: the
@@ -151,8 +151,9 @@ MART1_BOOLEAN_FEATURE_COLS = [
 MART2_COLUMNS = [CUSTOMER_ID_COL, DRUG_ID_COL, MART2_VALUE_COL]
 SEASON_COL = "계절"
 WEEKDAY_COL = "요일"
-# Expected consumption on one calendar day of the bucket, zero days included
-# -- not the mean per dispensing (see CONTEXT.md "Mart 3" and issue #36).
+# Expected consumption on one open day of the bucket, zero days included
+# -- not the mean per dispensing (see CONTEXT.md "Mart 3" and issues #36,
+# #41).
 MART3_VALUE_COL = "일평균_소모량"
 MART3_COLUMNS = [DRUG_ID_COL, SEASON_COL, WEEKDAY_COL, MART3_VALUE_COL]
 # Track 2's rare-drug counterpart to Mart 3 (see CONTEXT.md "Track 2
@@ -183,10 +184,11 @@ _WEEKDAY_INDEX_TO_NAME = dict(enumerate(MART3_WEEKDAYS))
 
 # Mart 3's sparse-bucket backoff thresholds (see CONTEXT.md "Track 2
 # Sparse-Bucket Backoff" and docs/adr/0003-mart3-population-and-backoff-thresholds.md):
-# separate bucket-level and season-level sufficiency bars, counted in
-# calendar days since the drug's first Acute dispensing, not in dispensings
-# (issue #36). Placeholders pending empirical tuning, not fixed business
-# requirements (see CONTEXT.md "Decision Thresholds (provisional)").
+# separate bucket-level and season-level sufficiency bars, counted in open
+# days since the drug's first Acute dispensing, not in dispensings (issue
+# #36), with Pharmacy Calendar closures left out (issue #41). Placeholders
+# pending empirical tuning, not fixed business requirements (see CONTEXT.md
+# "Decision Thresholds (provisional)").
 MART3_BUCKET_MIN_DAYS = 5
 MART3_SEASON_MIN_DAYS = 15
 
@@ -340,7 +342,8 @@ def build_marts(
     before `as_of_date` -- from Mart 1 only; they stay Chronic, so Mart 3
     still excludes their visits from their Chronic-since Date on.
     `pharmacy_calendar` sets Mart 1's 내일_휴무/오늘_휴무 (see
-    `_closed_day_features`); without one, no day is closed.
+    `_closed_day_features`) and keeps closed days out of Mart 3's day counts
+    (see `resolve_mart3_backoff`); without one, no day is closed.
     """
     as_of_date = pd.Timestamp(as_of_date)
     chronic_since = chronic_since_dates(raw_visits)
@@ -356,6 +359,7 @@ def build_marts(
         mart3_bucket_min_days,
         mart3_season_min_days,
         rare_drug_patient_threshold,
+        pharmacy_calendar,
     )
     return MartResult(mart1=mart1, mart2=mart2, mart3=mart3)
 
@@ -1575,18 +1579,29 @@ def _mart3_observations(
     ).reset_index(drop=True)
 
 
-def _drug_bucket_days(first_dates: pd.Series, as_of_date: pd.Timestamp) -> pd.DataFrame:
-    """Per drug x 계절 x 요일, how many calendar days of that bucket fall
+def _drug_bucket_days(
+    first_dates: pd.Series,
+    as_of_date: pd.Timestamp,
+    pharmacy_calendar: PharmacyCalendar,
+    dispensing_dates: pd.Series,
+) -> pd.DataFrame:
+    """Per drug x 계절 x 요일, how many open days of that bucket fall
     between the drug's first dispensing (`first_dates`, indexed by 약품ID)
-    and `as_of_date`, both inclusive. Buckets with no such day are absent.
+    and `as_of_date`, both inclusive. A day is open unless
+    `pharmacy_calendar` has it closed and nothing in `dispensing_dates` was
+    dispensed on it -- a listed closure the pharmacy dispensed on anyway was
+    open, so every day a drug's consumption is summed over is also counted.
+    Buckets with no such day are absent.
     """
-    calendar = pd.DataFrame({_CALENDAR_DAY_COL: pd.date_range(first_dates.min(), as_of_date)})
-    calendar[SEASON_COL] = _seasons_for(calendar[_CALENDAR_DAY_COL])
-    calendar[WEEKDAY_COL] = _weekdays_for(calendar[_CALENDAR_DAY_COL])
+    days = pd.Series(pd.date_range(first_dates.min(), as_of_date))
+    is_open = ~pharmacy_calendar.is_closed(days) | days.isin(dispensing_dates.dt.normalize())
+    open_days = pd.DataFrame({_OPEN_DAY_COL: days.loc[is_open]})
+    open_days[SEASON_COL] = _seasons_for(open_days[_OPEN_DAY_COL])
+    open_days[WEEKDAY_COL] = _weekdays_for(open_days[_OPEN_DAY_COL])
     starts = first_dates.to_numpy()
     frames = []
-    for (season, weekday), days in calendar.groupby([SEASON_COL, WEEKDAY_COL]):
-        bucket_dates = days[_CALENDAR_DAY_COL].to_numpy()
+    for (season, weekday), bucket in open_days.groupby([SEASON_COL, WEEKDAY_COL]):
+        bucket_dates = bucket[_OPEN_DAY_COL].to_numpy()
         frames.append(
             pd.DataFrame(
                 {
@@ -1606,24 +1621,31 @@ def resolve_mart3_backoff(
     as_of_date,
     bucket_min_days: int = MART3_BUCKET_MIN_DAYS,
     season_min_days: int = MART3_SEASON_MIN_DAYS,
+    pharmacy_calendar: PharmacyCalendar | None = None,
 ) -> pd.DataFrame:
     """Mart 3's drug x season x weekday grid of expected daily consumption
     (`MART3_VALUE_COL`), from one row per Acute drug-consumption observation
     (columns 약품ID, 내방일, 소모량) at or before `as_of_date`.
 
-    A drug's history is every calendar day from its first dispensing in
+    A drug's history is every open day from its first dispensing in
     `observations` to `as_of_date`, and a value is total 소모량 divided by
-    calendar days: days the drug wasn't dispensed count as zeros, so a day
-    the pharmacy is closed resolves to 0 rather than to a dispensing's worth
-    (issue #36), once its bucket has `bucket_min_days` days. A missing
+    those days: days the drug wasn't dispensed count as zeros, so a value is
+    expected consumption per open day rather than per dispensing (issue
+    #36). Days `pharmacy_calendar` has closed are left out of every tier's
+    day count (issue #41) -- nothing is dispensed on them, so counting them
+    would dilute open days' averages; Track 2 forecasts a closed target day
+    as 0 regardless (see `pipeline.inference`). Without a calendar every day
+    counts, and a bucket of always-closed days (Sundays) resolves to 0 once
+    it has `bucket_min_days` days. With one, such a bucket has few or no
+    days and backs off to its open-day season or overall average. A missing
     소모량 counts as 0, matching how `pipeline.backtest` sums actuals. Every drug present gets one row for each of the 28
     MART3_SEASONS x MART3_WEEKDAYS combinations, via hierarchical backoff
     (see CONTEXT.md "Track 2 Sparse-Bucket Backoff"):
 
     1. That bucket's own daily average, if the bucket has >= `bucket_min_days`
-       calendar days in the drug's history.
+       open days in the drug's history.
     2. Else that drug's season-only daily average (across every weekday), if
-       the season has >= `season_min_days` calendar days.
+       the season has >= `season_min_days` open days.
     3. Else that drug's overall daily average -- used unconditionally as the
        final fallback, so every bucket resolves to a usable estimate.
 
@@ -1652,9 +1674,11 @@ def resolve_mart3_backoff(
 
     bucket_keys = [DRUG_ID_COL, SEASON_COL, WEEKDAY_COL]
     season_keys = [DRUG_ID_COL, SEASON_COL]
-    bucket_days = _drug_bucket_days(first_dates, as_of_date)
+    bucket_days = _drug_bucket_days(
+        first_dates, as_of_date, pharmacy_calendar or PharmacyCalendar.always_open(), visit_dates
+    )
     season_days = bucket_days.groupby(season_keys)[_BUCKET_DAYS_COL].sum().rename(_SEASON_DAYS_COL)
-    drug_days = ((as_of_date - first_dates).dt.days + 1).rename(_DRUG_DAYS_COL)
+    drug_days = bucket_days.groupby(DRUG_ID_COL)[_BUCKET_DAYS_COL].sum().rename(_DRUG_DAYS_COL)
     consumption = observations[CONSUMPTION_COL]
     bucket_sums = consumption.groupby([observations[k] for k in bucket_keys]).sum()
     season_sums = consumption.groupby([observations[k] for k in season_keys]).sum()
@@ -1669,7 +1693,7 @@ def resolve_mart3_backoff(
     grid = grid.merge(season_sums.rename(_SEASON_SUM_COL).reset_index(), on=season_keys, how="left")
     grid = grid.merge(drug_days.reset_index(), on=DRUG_ID_COL, how="left")
     grid = grid.merge(drug_sums.rename(_DRUG_SUM_COL).reset_index(), on=DRUG_ID_COL, how="left")
-    # A bucket or season with no calendar day yet, or no dispensing in it,
+    # A bucket or season with no open day yet, or no dispensing in it,
     # is absent from the stats above: zero days, zero consumption.
     grid = grid.fillna(
         {_BUCKET_DAYS_COL: 0, _BUCKET_SUM_COL: 0.0, _SEASON_DAYS_COL: 0, _SEASON_SUM_COL: 0.0}
@@ -1838,10 +1862,13 @@ def _build_mart3(
     bucket_min_days: int = MART3_BUCKET_MIN_DAYS,
     season_min_days: int = MART3_SEASON_MIN_DAYS,
     rare_drug_patient_threshold: int = RARE_DRUG_PATIENT_THRESHOLD,
+    pharmacy_calendar: PharmacyCalendar | None = None,
 ) -> pd.DataFrame:
     # No empty-check needed here: resolve_mart3_backoff already returns an
     # empty MART3_COLUMNS frame when `observations` has no rows.
     observations = _mart3_observations(raw_visits, as_of_date, chronic_since)
     rare_drug_ids = _rare_drug_ids(raw_visits, as_of_date, chronic_since, rare_drug_patient_threshold)
     observations = observations.loc[~observations[DRUG_ID_COL].isin(rare_drug_ids)]
-    return resolve_mart3_backoff(observations, as_of_date, bucket_min_days, season_min_days)
+    return resolve_mart3_backoff(
+        observations, as_of_date, bucket_min_days, season_min_days, pharmacy_calendar
+    )

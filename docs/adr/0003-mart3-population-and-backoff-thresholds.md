@@ -46,3 +46,14 @@ The 0.27× option has the lowest WAPE, but only because WAPE rewards under-forec
 - **Stock floor only — chosen.** Rare drugs are a stock-level problem, not a daily-flow one, and forecasting 0 daily demand is closer to their actual daily consumption than either rate.
 
 **Result** (full backtest, v0.3, same test window and Track 1 model): forecast WAPE is unchanged from #36, since the stock floor never enters 최종발주량 or WAPE. Track 2 stays at 1.23 (72,407 predicted against 86,764 actual) and combined at 1.11. What #37 adds is the 희귀약_최소재고 column for rare Acute drugs, which previously got no output at all.
+
+**Update (issue #41)**: `N_bucket`, `N_season` and every tier's denominator now count **open days**, not calendar days: days the Pharmacy Calendar has closed are left out, unless the drug was dispensed on one (see [[0006-pharmacy-calendar-in-track1]]). A closed day has no dispensing, so counting it as a zero diluted every open day's rate. That was about 2% per weekday from holidays, and about a seventh in the season and overall tiers, which pooled closed Sundays. Without a calendar nothing changes, and a closed Sunday's bucket is a genuine 0 as decided above. With one, a Sunday bucket has almost no open days and backs off to its season's open-day rate; closed target days are zeroed downstream (#42).
+
+**Considered options** (full v0.3 backtest, same test window and Track 1 model as #42):
+
+| Denominator | Track 2 volume vs actual | Track 2 WAPE | Combined WAPE |
+|---|---|---|---|
+| Calendar days, closed days included (before) | 0.82× | 1.210 | 0.966 |
+| **Open days only — chosen** | **0.87×** | **1.238** | **0.968** |
+
+As with the estimand choice above, volume decided it over WAPE. WAPE rewards under-forecasting intermittent demand, and Track 2 still under-forecasts. Excluding closed days moves its volume toward actual, at a WAPE cost of 0.028. It also makes the estimand what Track 2 actually forecasts: demand on a day the pharmacy is open.

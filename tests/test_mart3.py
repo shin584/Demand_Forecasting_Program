@@ -19,6 +19,7 @@ from pipeline.marts import (
     resolve_mart3_backoff,
     season_and_weekday_for,
 )
+from pipeline.pharmacy_calendar import PharmacyCalendar
 
 
 def _observation(drug_id, visit_date, consumption):
@@ -33,6 +34,12 @@ def _daily_value(mart3, drug_id, season, weekday):
     return mart3.set_index([DRUG_ID_COL, SEASON_COL, WEEKDAY_COL])[MART3_VALUE_COL].loc[
         (drug_id, season, weekday)
     ]
+
+
+def _closed_on(*days):
+    return PharmacyCalendar(
+        closed_days=pd.DatetimeIndex(pd.to_datetime(list(days))), observed_through=None
+    )
 
 
 def test_default_bucket_min_days_is_five():
@@ -75,6 +82,75 @@ def test_bucket_with_days_but_no_dispensing_resolves_to_zero():
     mart3 = resolve_mart3_backoff(observations, "2024-01-28", bucket_min_days=4)
 
     assert _daily_value(mart3, 1, "겨울", "일요일") == 0.0
+
+
+def test_a_closed_day_is_not_one_of_its_buckets_days():
+    # Monday 2024-01-15 is a closed holiday, so the 겨울/월요일 bucket spans
+    # 3 open Mondays (1, 8, 22), not 4: a closed day isn't a zero-demand
+    # day for an open-day forecast to average over (issue #41).
+    observations = pd.DataFrame(
+        [_observation(1, "2024-01-01", 10.0), _observation(1, "2024-01-08", 20.0)]
+    )
+
+    mart3 = resolve_mart3_backoff(
+        observations, "2024-01-28", bucket_min_days=3, pharmacy_calendar=_closed_on("2024-01-15")
+    )
+
+    assert _daily_value(mart3, 1, "겨울", "월요일") == pytest.approx((10.0 + 20.0) / 3)
+
+
+def test_closed_days_drop_out_of_the_season_and_overall_backoff_tiers():
+    # First dispensed Monday 2024-02-26, as of Sunday 2024-03-03, with
+    # Tuesday 02-27 closed for a holiday: 3 open winter days (02-26, 02-28,
+    # 02-29) and 6 open days in all. 겨울/월요일 (1 Monday) backs off to the
+    # season's open-day average, and 여름/화요일 (no summer day yet) to the
+    # drug's overall one -- neither diluted by the closed day.
+    observations = pd.DataFrame(
+        [_observation(2, "2024-02-26", 40.0), _observation(2, "2024-03-01", 20.0)]
+    )
+
+    mart3 = resolve_mart3_backoff(
+        observations,
+        "2024-03-03",
+        bucket_min_days=2,
+        season_min_days=3,
+        pharmacy_calendar=_closed_on("2024-02-27"),
+    )
+
+    assert _daily_value(mart3, 2, "겨울", "월요일") == pytest.approx(40.0 / 3)
+    assert _daily_value(mart3, 2, "여름", "화요일") == pytest.approx(60.0 / 6)
+
+
+def test_a_sunday_bucket_with_no_open_day_backs_off_to_the_seasons_open_day_average():
+    # Every Sunday closed, as on the real calendar: 겨울/일요일 has no open
+    # day at all, so it backs off to the season's open-day average instead
+    # of resolving to 0 -- a forecast only used on an open Sunday, since a
+    # closed target day is forecast as 0 anyway.
+    observations = pd.DataFrame(
+        [_observation(1, "2024-01-01", 24.0), _observation(1, "2024-01-02", 24.0)]
+    )
+
+    mart3 = resolve_mart3_backoff(
+        observations,
+        "2024-01-28",
+        bucket_min_days=4,
+        season_min_days=24,
+        pharmacy_calendar=_closed_on("2024-01-07", "2024-01-14", "2024-01-21", "2024-01-28"),
+    )
+
+    assert _daily_value(mart3, 1, "겨울", "일요일") == pytest.approx(48.0 / 24)
+
+
+def test_a_listed_closed_day_with_a_dispensing_still_counts_as_open():
+    # The pharmacist listed 2024-01-10 as closed, but the drug was dispensed
+    # that day -- it was open, and its only day is the drug's whole history.
+    observations = pd.DataFrame([_observation(1, "2024-01-10", 30.0)])
+
+    mart3 = resolve_mart3_backoff(
+        observations, "2024-01-10", pharmacy_calendar=_closed_on("2024-01-10")
+    )
+
+    assert _daily_value(mart3, 1, "여름", "화요일") == pytest.approx(30.0)
 
 
 def test_bucket_days_are_counted_from_the_drugs_own_first_dispensing():
@@ -289,6 +365,30 @@ def test_build_marts_mart3_bucket_min_days_is_overridable():
     # 8: the bucket falls short, so the winter season's daily average
     # (46 days from 01-15 to 02-29, which clears the default season bar).
     assert _daily_value(strict_mart3, 1, "겨울", "월요일") == pytest.approx(70.0 / 46)
+
+
+def test_build_marts_mart3_counts_only_the_calendars_open_days():
+    raw_visits = make_raw_visits(
+        [
+            # The drug's 겨울/월요일 bucket spans 7 Mondays (01-15 to 02-26);
+            # the pharmacist closed 02-12 for a holiday, leaving 6.
+            make_visit_row(
+                조제판매ID=1, 고객ID=1, 내방일="2024-01-15", 약품ID=1, 소모량=60.0
+            ),
+            make_visit_row(
+                조제판매ID=2, 고객ID=2, 내방일="2024-07-03", 약품ID=1, 소모량=400.0
+            ),
+        ]
+    )
+
+    mart3 = build_marts(
+        raw_visits,
+        as_of_date="2024-08-01",
+        rare_drug_patient_threshold=1,
+        pharmacy_calendar=_closed_on("2024-02-12"),
+    ).mart3
+
+    assert _daily_value(mart3, 1, "겨울", "월요일") == pytest.approx(60.0 / 6)
 
 
 def test_mart3_excludes_a_drug_only_dispensed_after_customers_became_chronic():
