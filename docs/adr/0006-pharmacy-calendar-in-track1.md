@@ -49,3 +49,18 @@ By target day, after:
 | other open | 131 | 5,762 | 5,066 | 1.14× | 51 | 1.09 |
 
 Closed-day over-forecast is gone, and the Visit List shrinks from ~71 to ~51 a day. 오늘_휴무 only partly captures the pile-up: the first open day after a closure is still under-predicted (0.82×), while ordinary open days are now over-predicted (1.14×). Calibration fits one sigmoid across both, so a residual remains for a later issue.
+
+**Update (issue #42): Track 2 on closed target days.** The separate decision above is now made. On a closed target day Track 2's statistical value is 0 for every drug, so with Track 1 already 0 the final order quantity is 0. The rare-drug stock floor (희귀약_최소재고) is kept, since it is a stock level, not daily flow. Closed-day Acute demand is not rolled forward onto the next open day: walk-in Acute patients often go to another pharmacy when this one is closed, and moving all of it forward would worsen open-day over-forecasting. Mart 3's calendar-day denominators still include closed days; excluding them is deferred, to be decided from the open-day Track 2 WAPE below.
+
+Full v0.3 backtest, same 185 as-of dates and same retrained Track 1 model as above (cutoff 0.160, 27 closed target days):
+
+| | before | after |
+|---|---|---|
+| Combined WAPE | 0.968 | 0.966 |
+| Track 1 WAPE | 1.030 | 1.030 |
+| Track 2 WAPE | 1.229 | 1.210 |
+| Track 2 predicted (actual 86,764) | 72,407 (0.83×) | 70,759 (0.82×) |
+| Track 2 predicted on closed target days | 1,648 | 0 |
+| Track 2 on open target days: predicted / actual / WAPE | 70,759 / 86,764 / 1.210 | 70,759 / 86,764 / 1.210 |
+
+The whole gain is the removed closed-day forecast (about 61 units per closed day, from holidays and young drugs' backed-off Sundays); open days are unchanged, as intended. Track 2 still under-forecasts open days (0.82×), so the ~2% per-weekday dilution from closed days in Mart 3's denominators is small next to Track 2's remaining error, and is left as deferred.
