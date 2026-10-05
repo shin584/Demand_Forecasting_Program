@@ -84,6 +84,13 @@ class BacktestSummary(NamedTuple):
     total_actual: float
     track1_wape: float
     track2_wape: float
+    # Track 2 split by whether the target date is closed (see issue #42).
+    # Inside the extract a closed day has no actual dispensing, so only its
+    # predicted volume is reported.
+    track2_closed_predicted: float
+    track2_open_predicted: float
+    track2_open_actual: float
+    track2_open_wape: float
 
 
 class BacktestResult(NamedTuple):
@@ -118,7 +125,7 @@ def run_backtest(
     `model.predict_proba` gives -- calibrated, for a `CalibratedTrack1Model`.
     `chronic_visit_prob_cutoff` is forwarded to `run_daily_forecast`; left
     unset, that uses the model's own tuned cutoff. So is
-    `pharmacy_calendar`, which zeroes Track 1 on closed target dates.
+    `pharmacy_calendar`, which zeroes both tracks on closed target dates.
 
     Returns a `BacktestResult`:
 
@@ -135,7 +142,9 @@ def run_backtest(
       closed (내일_휴무).
     - `summary`: overall WAPE across every row in `daily`, total
       predicted/actual volume for context, and a WAPE per track (each
-      track's predicted against its own actual).
+      track's predicted against its own actual). Track 2 is also split by
+      `per_date`'s 내일_휴무: predicted volume on closed target dates, and
+      predicted, actual and WAPE on open ones.
 
     WAPE is `sum(abs(predicted - actual)) /
     sum(actual)`; `nan` if `daily` is empty or nothing was actually consumed
@@ -160,7 +169,7 @@ def run_backtest(
         per_date = pd.concat([day.per_date for day in days], ignore_index=True)
     else:
         daily, per_date = _empty_daily(), _empty_per_date()
-    return BacktestResult(daily=daily, per_date=per_date, summary=_summarize(daily))
+    return BacktestResult(daily=daily, per_date=per_date, summary=_summarize(daily, per_date))
 
 
 def _empty_daily() -> pd.DataFrame:
@@ -220,7 +229,7 @@ def _backtest_one_day(
             ACTUAL_CHRONIC_VISITS_COL: [len(scored_customer_ids & visited_customer_ids)],
             VISIT_LIST_SIZE_COL: [len(forecast.visit_list)],
             SCORED_POPULATION_SIZE_COL: [len(scored_customer_ids)],
-            CLOSED_TOMORROW_COL: [bool(calendar.is_closed(pd.Series([target_date])).iloc[0])],
+            CLOSED_TOMORROW_COL: [calendar.is_closed_on(target_date)],
         }
     )
     return _BacktestDay(daily=daily[BACKTEST_DAILY_COLUMNS], per_date=per_date)
@@ -276,13 +285,20 @@ def _actual_drug_demand(target_visits: pd.DataFrame, scored_customer_ids: set) -
     ].sum()
 
 
-def _summarize(daily: pd.DataFrame) -> BacktestSummary:
+def _summarize(daily: pd.DataFrame, per_date: pd.DataFrame) -> BacktestSummary:
+    closed_dates = per_date.loc[per_date[CLOSED_TOMORROW_COL], SNAPSHOT_DATE_COL]
+    is_closed = daily[SNAPSHOT_DATE_COL].isin(closed_dates)
+    track2_open = daily.loc[~is_closed]
     return BacktestSummary(
         wape=_wape(daily[PREDICTED_COL], daily[ACTUAL_COL]),
         total_predicted=daily[PREDICTED_COL].sum(),
         total_actual=daily[ACTUAL_COL].sum(),
         track1_wape=_wape(daily[TRACK1_PREDICTED_COL], daily[TRACK1_ACTUAL_COL]),
         track2_wape=_wape(daily[TRACK2_PREDICTED_COL], daily[TRACK2_ACTUAL_COL]),
+        track2_closed_predicted=daily.loc[is_closed, TRACK2_PREDICTED_COL].sum(),
+        track2_open_predicted=track2_open[TRACK2_PREDICTED_COL].sum(),
+        track2_open_actual=track2_open[TRACK2_ACTUAL_COL].sum(),
+        track2_open_wape=_wape(track2_open[TRACK2_PREDICTED_COL], track2_open[TRACK2_ACTUAL_COL]),
     )
 
 

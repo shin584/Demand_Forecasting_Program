@@ -12,7 +12,8 @@ tuned, F1-maximising one, or the default `CHRONIC_VISIT_PROB_CUTOFF` if none
 could be tuned). Closed days come from the extract itself
 (`PharmacyCalendar.from_visits`: a day with no dispensing is closed), and
 the report splits Track 1's figures by whether the target day was closed,
-the first open day after a closure, or any other open day (issue #39). A
+the first open day after a closure, or any other open day (issue #39), and
+Track 2's by closed vs open target day (issue #42). A
 full run walks one calendar day at a time across the
 whole test window (6 months by default), rebuilding Mart 1/2/3 as of each
 day -- a few seconds per day on the v0.3 extract; pass a narrower
@@ -132,6 +133,16 @@ def _target_day_kind_table(result, calendar: PharmacyCalendar) -> pd.DataFrame:
     return table.drop(columns="_error")
 
 
+def _track2_closed_open_summary(summary) -> str:
+    """Track 2 split by target day (see issue #42): a closed day has no
+    actual dispensing inside the extract, so only its predicted volume."""
+    return (
+        f"Track 2 on closed target days: predicted {summary.track2_closed_predicted:.2f}\n"
+        f"Track 2 on open target days: predicted {summary.track2_open_predicted:.2f}, "
+        f"actual {summary.track2_open_actual:.2f}, WAPE {summary.track2_open_wape:.4f}\n"
+    )
+
+
 def _training_summary(trained) -> str:
     tuning = trained.cutoff_tuning
     if tuning.cutoff is None:
@@ -172,6 +183,8 @@ def _write_report(
         f.write(f"Total predicted: {summary.total_predicted:.2f}\n")
         f.write(f"Total actual: {summary.total_actual:.2f}\n")
         f.write(f"Days: {len(result.per_date)}\n\n")
+        f.write(_track2_closed_open_summary(summary))
+        f.write("\n")
         f.write("Track 1 by target day:\n")
         f.write(_target_day_kind_table(result, calendar).to_string())
         f.write("\n\n")
@@ -222,6 +235,7 @@ def main() -> None:
     )
     _write_report(REPORT_PATH, result, training_summary, calendar)
     print(_target_day_kind_table(result, calendar).to_string())
+    print(_track2_closed_open_summary(result.summary), end="")
 
     print(
         f"WAPE: {result.summary.wape:.4f} (Track 1 {result.summary.track1_wape:.4f}, "

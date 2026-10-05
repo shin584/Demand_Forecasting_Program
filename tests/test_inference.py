@@ -799,3 +799,80 @@ def test_daily_forecast_has_no_track1_demand_on_a_closed_target_day():
 
     assert result.visit_list.empty
     assert result.order_quantities[TRACK1_DEMAND_COL].sum() == 0.0
+
+
+# --- Track 2 on a closed target day (issue #42). ---
+
+
+def _track2_forecast(raw_visits, as_of_date, pharmacy_calendar=None, **kwargs) -> pd.DataFrame:
+    """`run_daily_forecast`'s order-quantity table for an Acute-only
+    fixture (no Chronic customers to score), indexed by 약품ID."""
+    result = run_daily_forecast(
+        raw_visits,
+        as_of_date=as_of_date,
+        model=StubModel([]),
+        pharmacy_calendar=pharmacy_calendar,
+        **kwargs,
+    )
+    return result.order_quantities.set_index(DRUG_ID_COL)
+
+
+def test_track2_forecasts_nothing_on_a_closed_holiday():
+    # Target date 2024-01-15 is a Monday, closed as a holiday; its own
+    # 겨울/월요일 bucket would otherwise forecast 42.0.
+    raw_visits = _acute_observation_visits(drug_id=501, visit_date="2024-01-08", consumption=42.0)
+    kwargs = dict(rare_drug_patient_threshold=1, mart3_bucket_min_days=1)
+
+    without_calendar = _track2_forecast(raw_visits, "2024-01-14", **kwargs)
+    closed = _track2_forecast(
+        raw_visits, "2024-01-14", pharmacy_calendar=closed_on("2024-01-15"), **kwargs
+    )
+
+    assert without_calendar.loc[501, TRACK2_STAT_COL] == 42.0
+    # Every drug, the filler's noise drugs included.
+    assert (without_calendar[TRACK2_STAT_COL] > 0.0).sum() > 1
+    assert (closed[TRACK2_STAT_COL] == 0.0).all()
+    assert (closed[FINAL_ORDER_COL] == 0.0).all()
+
+
+def test_track2_forecasts_nothing_on_a_closed_sunday_whose_bucket_backs_off():
+    # Drug 501 was first dispensed 2024-01-08, so by Saturday 2024-01-20 its
+    # Sunday bucket has a single day and backs off to the overall daily
+    # average (42.0 over 13 days) -- positive, unless the calendar closes
+    # the target Sunday.
+    raw_visits = _acute_observation_visits(drug_id=501, visit_date="2024-01-08", consumption=42.0)
+
+    without_calendar = _track2_forecast(raw_visits, "2024-01-20", rare_drug_patient_threshold=1)
+    closed = _track2_forecast(
+        raw_visits,
+        "2024-01-20",
+        pharmacy_calendar=closed_on("2024-01-21"),
+        rare_drug_patient_threshold=1,
+    )
+
+    assert without_calendar.loc[501, TRACK2_STAT_COL] == pytest.approx(42.0 / 13)
+    assert (closed[TRACK2_STAT_COL] == 0.0).all()
+    assert (closed[FINAL_ORDER_COL] == 0.0).all()
+
+
+def test_a_closed_target_day_keeps_the_rare_acute_stock_floor():
+    # A single Acute patient: rare under the default threshold (5).
+    raw_visits = _acute_observation_visits(drug_id=501, visit_date="2024-01-08", consumption=42.0)
+
+    order = _track2_forecast(raw_visits, "2024-01-14", pharmacy_calendar=closed_on("2024-01-15"))
+
+    assert order.loc[501, RARE_STOCK_FLOOR_COL] == 42.0
+    assert order.loc[501, FINAL_ORDER_COL] == 0.0
+
+
+def test_an_open_target_day_gets_the_same_order_quantities_as_without_a_calendar():
+    raw_visits = _acute_observation_visits(drug_id=501, visit_date="2024-01-08", consumption=42.0)
+    kwargs = dict(rare_drug_patient_threshold=1, mart3_bucket_min_days=1)
+
+    without_calendar = _track2_forecast(raw_visits, "2024-01-14", **kwargs)
+    open_day = _track2_forecast(
+        raw_visits, "2024-01-14", pharmacy_calendar=closed_on("2024-01-14"), **kwargs
+    )
+
+    assert without_calendar.loc[501, TRACK2_STAT_COL] == 42.0
+    pd.testing.assert_frame_equal(open_day, without_calendar)

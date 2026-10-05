@@ -12,7 +12,8 @@ for the design this encodes. Issue #20 built `run_track1_inference`; issue
 #21 (this module's `run_daily_forecast`/`_combine_order_quantities`) added
 Track 2's lookup and the combined table on top of its output; issue #22
 added the Chronic-population rare-drug allocation override into
-`_track1_drug_demand`; issue #37 added Track 2 Rare-Drug Allocation.
+`_track1_drug_demand`; issue #37 added Track 2 Rare-Drug Allocation;
+issue #42 zeroed Track 2 on closed target days.
 """
 
 from __future__ import annotations
@@ -316,8 +317,11 @@ def run_daily_forecast(
     Track 1's Mart 1 population (see `run_track1_inference`).
     `chronic_visit_prob_cutoff` defaults to the model's own tuned cutoff, as
     in `run_track1_inference`. `pharmacy_calendar` zeroes Track 1 on a
-    closed target date, as in `run_track1_inference`; Track 2 doesn't read
-    it.
+    closed target date, as in `run_track1_inference`, and Track 2's daily
+    demand too, so 최종발주량 is 0 for every drug; 희귀약_최소재고 is kept,
+    being a stock level rather than daily flow. Closed-day demand isn't
+    rolled forward onto the next open day (see CONTEXT.md "Pharmacy
+    Calendar").
 
     `order_quantities` (`ORDER_QUANTITY_COLUMNS`: 기준일자, 약품ID, 약품명,
     track1_기댓값, track2_통계값, 최종발주량, 희귀약_최소재고) is the union of
@@ -355,7 +359,13 @@ def run_daily_forecast(
         raw_visits, as_of_date, rare_drug_patient_threshold
     )
     order_quantities = _combine_order_quantities(
-        track1.drug_demand, mart3, track2_rare_drugs, raw_visits, as_of_date, safety_stock_buffer
+        track1.drug_demand,
+        mart3,
+        track2_rare_drugs,
+        raw_visits,
+        as_of_date,
+        safety_stock_buffer,
+        pharmacy_calendar or PharmacyCalendar.always_open(),
     )
     return ForecastResult(
         order_quantities=order_quantities,
@@ -371,16 +381,21 @@ def _combine_order_quantities(
     raw_visits: pd.DataFrame,
     as_of_date: pd.Timestamp,
     safety_stock_buffer: float,
+    pharmacy_calendar: PharmacyCalendar,
 ) -> pd.DataFrame:
     """Combines Track 1's per-drug demand with Track 2's estimate for
-    the target date (`as_of_date + 1 day`) into `ORDER_QUANTITY_COLUMNS`.
+    the target date (`as_of_date + 1 day`) into `ORDER_QUANTITY_COLUMNS`;
+    Track 2's daily demand is 0 when `pharmacy_calendar` has the target date
+    closed (see `_track2_drug_demand`).
 
     A zero-filled outer union on 약품ID: a drug missing from one track
     contributes 0 to that track's column rather than dropping the row, so no
     drug that either track has something to say about is silently omitted.
     """
     target_date = as_of_date + pd.Timedelta(days=1)
-    track2_drug_demand = _track2_drug_demand(mart3, track2_rare_drugs, target_date)
+    track2_drug_demand = _track2_drug_demand(
+        mart3, track2_rare_drugs, target_date, pharmacy_calendar.is_closed_on(target_date)
+    )
 
     combined = track1_drug_demand[[DRUG_ID_COL, TRACK1_DEMAND_COL]].merge(
         track2_drug_demand, on=DRUG_ID_COL, how="outer"
@@ -400,7 +415,10 @@ def _combine_order_quantities(
 
 
 def _track2_drug_demand(
-    mart3: pd.DataFrame, track2_rare_drugs: pd.DataFrame, target_date: pd.Timestamp
+    mart3: pd.DataFrame,
+    track2_rare_drugs: pd.DataFrame,
+    target_date: pd.Timestamp,
+    target_closed: bool,
 ) -> pd.DataFrame:
     """Track 2's per-drug statistical estimate (`TRACK2_STAT_COL`) and
     stock floor (`RARE_STOCK_FLOOR_COL`). For an ordinary drug, Mart 3's
@@ -408,9 +426,15 @@ def _track2_drug_demand(
     at `target_date`'s own (계절, 요일) bucket (see CONTEXT.md "Track 2
     Sparse-Bucket Backoff"), with no stock floor. For a rare Acute drug,
     which has no Mart 3 row, no daily demand -- only its stock floor from
-    `track2_rare_drugs` (see CONTEXT.md "Track 2 Rare-Drug Allocation")."""
+    `track2_rare_drugs` (see CONTEXT.md "Track 2 Rare-Drug Allocation").
+
+    When `target_closed`, every ordinary drug's estimate is 0 -- whatever
+    its bucket, or the season or overall rate it backs off to, would say --
+    while the stock floor is kept."""
     season, weekday = season_and_weekday_for(target_date)
     bucket = mart3.loc[(mart3[SEASON_COL] == season) & (mart3[WEEKDAY_COL] == weekday)]
+    if target_closed:
+        bucket = bucket.assign(**{MART3_VALUE_COL: 0.0})
     parts = [
         part
         for part in (bucket[[DRUG_ID_COL, MART3_VALUE_COL]], track2_rare_drugs)

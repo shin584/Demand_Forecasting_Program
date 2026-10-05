@@ -443,3 +443,72 @@ def test_per_date_marks_no_day_closed_without_a_calendar():
     result = run_backtest(raw_visits, StubModel(0.5), test_dates=["2024-01-13", "2024-01-14"])
 
     assert not result.per_date[CLOSED_TOMORROW_COL].any()
+
+
+def _acute_drug_600_fixture() -> pd.DataFrame:
+    """Five one-off Acute customers dispensing drug 600 in early January
+    (enough patients to clear the rare-drug threshold, so Mart 3 forecasts
+    it every day), plus one more Acute customer dispensing 25.0 of it on
+    2024-01-15 -- the open target date for as-of 2024-01-14. Nothing is
+    dispensed on 2024-01-16."""
+    return make_raw_visits(
+        _one_chronic_customer_on_drug_501()
+        + [
+            make_visit_row(
+                조제판매ID=200 + i, 고객ID=30 + i, 내방일=f"2024-01-0{i + 1}", 약품ID=600, 소모량=10.0
+            )
+            for i in range(5)
+        ]
+        + [make_visit_row(조제판매ID=210, 고객ID=40, 내방일="2024-01-15", 약품ID=600, 소모량=25.0)]
+    )
+
+
+def _track2_predicted_on(result, as_of_date: str) -> float:
+    on_date = result.daily[SNAPSHOT_DATE_COL] == pd.Timestamp(as_of_date)
+    return result.daily.loc[on_date, TRACK2_PREDICTED_COL].sum()
+
+
+def test_summary_splits_track2_by_closed_and_open_target_days():
+    result = run_backtest(
+        _acute_drug_600_fixture(),
+        StubModel(0.5),
+        test_dates=["2024-01-14", "2024-01-15"],
+        pharmacy_calendar=closed_on("2024-01-16"),
+    )
+
+    open_predicted = _track2_predicted_on(result, "2024-01-14")
+    summary = result.summary
+    assert summary.track2_closed_predicted == pytest.approx(
+        _track2_predicted_on(result, "2024-01-15")
+    )
+    assert summary.track2_open_predicted == pytest.approx(open_predicted)
+    assert summary.track2_open_actual == pytest.approx(25.0)
+    assert summary.track2_open_wape == pytest.approx(abs(open_predicted - 25.0) / 25.0)
+
+
+def test_summary_counts_every_target_day_open_without_a_calendar():
+    result = run_backtest(
+        _acute_drug_600_fixture(), StubModel(0.5), test_dates=["2024-01-14", "2024-01-15"]
+    )
+
+    summary = result.summary
+    assert summary.track2_closed_predicted == 0.0
+    assert summary.track2_open_predicted == pytest.approx(result.daily[TRACK2_PREDICTED_COL].sum())
+    assert summary.track2_open_actual == pytest.approx(25.0)
+    assert summary.track2_open_wape == pytest.approx(summary.track2_wape)
+
+
+def test_track2_predicts_nothing_on_a_closed_target_day():
+    without_calendar = run_backtest(
+        _acute_drug_600_fixture(), StubModel(0.5), test_dates=["2024-01-15"]
+    )
+    with_calendar = run_backtest(
+        _acute_drug_600_fixture(),
+        StubModel(0.5),
+        test_dates=["2024-01-15"],
+        pharmacy_calendar=closed_on("2024-01-16"),
+    )
+
+    assert without_calendar.summary.track2_open_predicted > 0.0
+    assert with_calendar.summary.track2_closed_predicted == 0.0
+    assert with_calendar.daily[TRACK2_PREDICTED_COL].sum() == 0.0

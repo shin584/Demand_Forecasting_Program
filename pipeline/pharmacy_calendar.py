@@ -70,3 +70,7 @@ class PharmacyCalendar:
         if self.observed_through is not None:
             closed |= (days > self.observed_through) & (days.dt.dayofweek == _SUNDAY)
         return closed.astype(bool)
+
+    def is_closed_on(self, date: pd.Timestamp | str) -> bool:
+        """Whether the pharmacy is closed on the single day `date`."""
+        return bool(self.is_closed(pd.Series([pd.Timestamp(date)])).iloc[0])

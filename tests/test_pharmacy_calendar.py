@@ -67,3 +67,10 @@ def test_result_keeps_the_input_index():
     dates = pd.Series(pd.to_datetime(["2024-01-02", "2024-01-03"]), index=[10, 20])
 
     assert calendar.is_closed(dates).index.tolist() == [10, 20]
+
+
+def test_is_closed_on_answers_for_a_single_day():
+    calendar = PharmacyCalendar.from_visits(_visits_on("2024-01-01", "2024-01-02", "2024-01-04"))
+
+    assert calendar.is_closed_on("2024-01-03") is True
+    assert calendar.is_closed_on(pd.Timestamp("2024-01-04")) is False
