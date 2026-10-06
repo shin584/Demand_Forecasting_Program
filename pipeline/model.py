@@ -24,6 +24,7 @@ from scipy.special import expit, logit
 from sklearn.metrics import precision_recall_curve, roc_auc_score
 
 from .marts import (
+    CLOSED_TODAY_COL,
     CLOSED_TOMORROW_COL,
     GENDER_COL,
     INSURANCE_TYPE_COL,
@@ -75,35 +76,56 @@ LIGHTGBM_EARLY_STOPPING_ROUNDS = 20
 @dataclass(frozen=True)
 class PlattCalibrator:
     """A Platt (sigmoid) map from a raw visit score to a calibrated
-    probability: `sigmoid(slope * logit(raw) + intercept)` (see CONTEXT.md
-    "Visit-Probability Calibration")."""
+    probability: `sigmoid(slope * logit(raw) + intercept)`, plus
+    `after_closure_shift` on a row whose snapshot day was closed (오늘_휴무),
+    i.e. whose target day is the first open day after a closure (see
+    CONTEXT.md "Visit-Probability Calibration" and issue #40)."""
 
     slope: float
     intercept: float
+    # Defaulted so a calibrator saved before issue #40 still loads, with no
+    # shift.
+    after_closure_shift: float = 0.0
 
     @classmethod
-    def fit(cls, raw_proba, y) -> PlattCalibrator:
+    def fit(cls, raw_proba, y, after_closure=None) -> PlattCalibrator:
         """Fits by maximum likelihood on `raw_proba` (positive-class scores)
         against the 0/1 labels `y`, with Platt's smoothed targets
         (`(N+ + 1) / (N+ + 2)` and `1 / (N- + 2)`) so perfectly separable
-        scores still give a finite fit."""
+        scores still give a finite fit. `after_closure` flags the rows whose
+        snapshot day was closed; they share the slope and get their own
+        intercept. Without any flagged row the shift stays 0."""
         scores = _logit(raw_proba)
         y = np.asarray(y, dtype=bool)
+        flags = _after_closure_flags(after_closure, y.size)
         n_pos = y.sum()
         n_neg = y.size - n_pos
         targets = np.where(y, (n_pos + 1) / (n_pos + 2), 1 / (n_neg + 2))
 
         def loss_and_grad(params):
-            z = params[0] * scores + params[1]
+            z = params[0] * scores + params[1] + params[2] * flags
             loss = np.sum(np.logaddexp(0.0, z) - targets * z)
             residual = expit(z) - targets
-            return loss, np.array([residual @ scores, residual.sum()])
+            return loss, np.array([residual @ scores, residual.sum(), residual @ flags])
 
-        fitted = minimize(loss_and_grad, x0=[1.0, 0.0], jac=True, method="L-BFGS-B")
-        return cls(slope=float(fitted.x[0]), intercept=float(fitted.x[1]))
+        fitted = minimize(loss_and_grad, x0=[1.0, 0.0, 0.0], jac=True, method="L-BFGS-B")
+        return cls(
+            slope=float(fitted.x[0]),
+            intercept=float(fitted.x[1]),
+            after_closure_shift=float(fitted.x[2]),
+        )
 
-    def transform(self, raw_proba) -> np.ndarray:
-        return expit(self.slope * _logit(raw_proba) + self.intercept)
+    def transform(self, raw_proba, after_closure=None) -> np.ndarray:
+        scores = _logit(raw_proba)
+        flags = _after_closure_flags(after_closure, scores.size)
+        return expit(self.slope * scores + self.intercept + self.after_closure_shift * flags)
+
+
+def _after_closure_flags(after_closure, n: int) -> np.ndarray:
+    """`after_closure` as a 0/1 float array, or all zeros when None."""
+    if after_closure is None:
+        return np.zeros(n)
+    return np.asarray(after_closure, dtype=float)
 
 
 @dataclass(frozen=True)
@@ -125,7 +147,9 @@ class CalibratedTrack1Model:
     chronic_visit_prob_cutoff: float | None = None
 
     def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
-        calibrated = self.calibrator.transform(self.classifier.predict_proba(X)[:, 1])
+        calibrated = self.calibrator.transform(
+            self.classifier.predict_proba(X)[:, 1], X[CLOSED_TODAY_COL]
+        )
         return np.column_stack([1 - calibrated, calibrated])
 
 
@@ -182,6 +206,11 @@ def train_track1_model(
     `visit_probabilities`, closed days included, exactly as inference sees
     them.
 
+    The classifier barely learns the pile-up of visits on the first open
+    day after a closure from 오늘_휴무 (issue #40), so the calibrator gives
+    those rows their own intercept (`PlattCalibrator.after_closure_shift`)
+    rather than splitting the difference with ordinary open days.
+
     `train`/`val`/`test` are Mart 1 rows (matching
     `MART1_TRAINING_COLUMNS`/`MART1_COLUMNS` -- see
     `pipeline.marts.split_mart1_training_set`): X-features (`FEATURE_COLS`)
@@ -221,7 +250,9 @@ def train_track1_model(
 
     is_open = ~val[CLOSED_TOMORROW_COL].astype(bool).to_numpy()
     raw_val_proba = classifier.predict_proba(X_val[is_open])[:, 1]
-    calibrator = PlattCalibrator.fit(raw_val_proba, y_val[is_open])
+    calibrator = PlattCalibrator.fit(
+        raw_val_proba, y_val[is_open], val[CLOSED_TODAY_COL].to_numpy()[is_open]
+    )
     val_proba = visit_probabilities(
         CalibratedTrack1Model(classifier=classifier, calibrator=calibrator), val
     )

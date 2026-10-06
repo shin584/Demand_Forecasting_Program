@@ -149,10 +149,15 @@ def test_calibrated_validation_probabilities_match_the_validation_base_rate():
     assert result.metrics["base_rate"] == pytest.approx(base_rate)
 
 
+def _platt(raw, slope: float, intercept: float, shift=0.0) -> np.ndarray:
+    """The calibrated probability a known Platt sigmoid gives `raw`."""
+    return 1 / (1 + np.exp(-(slope * np.log(raw / (1 - raw)) + intercept + shift)))
+
+
 def test_platt_calibrator_recovers_a_known_sigmoid():
     rng = np.random.default_rng(0)
     raw = rng.uniform(0.01, 0.99, size=50_000)
-    true_p = 1 / (1 + np.exp(-(0.5 * np.log(raw / (1 - raw)) - 2.0)))
+    true_p = _platt(raw, slope=0.5, intercept=-2.0)
     y = rng.uniform(size=raw.size) < true_p
 
     calibrator = PlattCalibrator.fit(raw, y)
@@ -173,6 +178,35 @@ def test_platt_calibrator_stays_finite_on_perfectly_separable_scores():
     assert (calibrated[:3] < 0.5).all() and (calibrated[3:] > 0.5).all()
 
 
+def test_platt_calibrator_recovers_the_shift_after_a_closure():
+    # Visits pile up on the first open day after a closure by more than the
+    # raw score knows (issue #40): the same raw score means a higher
+    # probability when the snapshot day was closed.
+    rng = np.random.default_rng(0)
+    raw = rng.uniform(0.01, 0.99, size=50_000)
+    after_closure = rng.uniform(size=raw.size) < 0.3
+    true_p = _platt(raw, slope=0.5, intercept=-2.0, shift=0.4 * after_closure)
+    y = rng.uniform(size=raw.size) < true_p
+
+    calibrator = PlattCalibrator.fit(raw, y, after_closure)
+
+    assert calibrator.slope == pytest.approx(0.5, abs=0.05)
+    assert calibrator.intercept == pytest.approx(-2.0, abs=0.1)
+    assert calibrator.after_closure_shift == pytest.approx(0.4, abs=0.1)
+    np.testing.assert_allclose(calibrator.transform(raw, after_closure), true_p, atol=0.02)
+
+
+def test_platt_calibrator_without_rows_after_a_closure_has_no_shift():
+    rng = np.random.default_rng(0)
+    raw = rng.uniform(0.01, 0.99, size=1_000)
+    y = rng.uniform(size=raw.size) < raw
+
+    all_false_flags = PlattCalibrator.fit(raw, y, np.zeros(raw.size, dtype=bool))
+
+    assert all_false_flags.after_closure_shift == 0.0
+    assert all_false_flags == PlattCalibrator.fit(raw, y)
+
+
 class StubModel:
     """`predict_proba`-only stand-in returning given positive-class
     probabilities, so a test can check exactly what calibration does to them."""
@@ -189,11 +223,22 @@ def test_calibrated_model_applies_the_calibrator_to_raw_scores():
     calibrator = PlattCalibrator(slope=2.0, intercept=-1.0)
     model = CalibratedTrack1Model(classifier=StubModel(raw), calibrator=calibrator)
 
-    proba = model.predict_proba(pd.DataFrame(index=range(3)))
+    proba = model.predict_proba(pd.DataFrame({CLOSED_TODAY_COL: [False] * 3}))
 
-    expected = 1 / (1 + np.exp(-(2.0 * np.log(raw / (1 - raw)) - 1.0)))
+    expected = _platt(raw, slope=2.0, intercept=-1.0)
     np.testing.assert_allclose(proba[:, 1], expected)
     np.testing.assert_allclose(proba[:, 0], 1 - expected)
+
+
+def test_calibrated_model_shifts_rows_after_a_closure():
+    raw = np.array([0.2, 0.5, 0.9])
+    calibrator = PlattCalibrator(slope=2.0, intercept=-1.0, after_closure_shift=0.5)
+    model = CalibratedTrack1Model(classifier=StubModel(raw), calibrator=calibrator)
+
+    proba = model.predict_proba(pd.DataFrame({CLOSED_TODAY_COL: [False, True, False]}))
+
+    expected = _platt(raw, slope=2.0, intercept=-1.0, shift=np.array([0.0, 0.5, 0.0]))
+    np.testing.assert_allclose(proba[:, 1], expected)
 
 
 # 10 Next-Day Visits among 20 rows: cutoff 0.9 admits 5 of them, 0.8
@@ -406,3 +451,21 @@ def test_closed_target_days_add_nothing_to_validation_metrics_or_test_sum_p():
     assert result.cutoff_tuning == tune_chronic_cutoff(val[NEXT_DAY_VISIT_COL], val_proba)
     open_sum_p = result.model.predict_proba(prepare_track1_features(open_test))[:, 1].sum()
     assert result.sum_p_check.sum_p == pytest.approx(open_sum_p)
+
+
+def test_calibration_matches_the_visit_rate_after_a_closure():
+    # Train never sees a closed snapshot day, so the classifier can't learn
+    # the pile-up; validation's first open day after a closure has twice the
+    # ordinary visit rate. One shared sigmoid would split the difference
+    # (issue #40); calibration must match each kind of open day.
+    train = _make_mart1_training_frame(600, seed=1)
+    ordinary = _noisy_frame(2000, seed=2, due_visit_rate=0.2)
+    after_closure = _noisy_frame(2000, seed=4, due_visit_rate=0.4)
+    after_closure[CLOSED_TODAY_COL] = True
+    val = pd.concat([ordinary, after_closure], ignore_index=True)
+
+    result = train_track1_model(train, val)
+
+    for rows in (ordinary, after_closure):
+        mean_p = result.model.predict_proba(prepare_track1_features(rows))[:, 1].mean()
+        assert mean_p == pytest.approx(rows[NEXT_DAY_VISIT_COL].mean(), abs=0.01)
