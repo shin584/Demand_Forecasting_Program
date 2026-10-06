@@ -57,3 +57,23 @@ The 0.27× option has the lowest WAPE, but only because WAPE rewards under-forec
 | **Open days only — chosen** | **0.87×** | **1.238** | **0.968** |
 
 As with the estimand choice above, volume decided it over WAPE. WAPE rewards under-forecasting intermittent demand, and Track 2 still under-forecasts. Excluding closed days moves its volume toward actual, at a WAPE cost of 0.028. It also makes the estimand what Track 2 actually forecasts: demand on a day the pharmacy is open.
+
+**Update (issue #38)**: #36's consequence above, a brand-new drug forecast at a whole dispensing a day until its history fills in, was measured and left unfixed. The full v0.3 test window was replayed with every change through #41 in place (Track 2 on open target days: 75,459 predicted against 86,764 actual, WAPE 1.238, matching the full backtest). Each drug-day was attributed by drug age: days from the drug's first Acute dispensing to the as-of date, counting the first day as day 1.
+
+| Drug age at as-of date, Track 2 forecast | Drug-days | Drugs | Predicted | Actual | Share of Track 2 abs error | Share of over-forecast |
+|---|---|---|---|---|---|---|
+| < 30 days, positive forecast | 24 | 4 | 613 | 332 | 0.45% | 0.79% |
+| < 30 days, forecast 0 | 1,136 | 48 | 0 | 1,573 | 1.46% | 0% |
+| 30–180 days, positive forecast | 251 | 7 | 559 | 340 | 0.74% | 1.05% |
+| > 180 days, positive forecast | 16,322 | 147 | 74,287 | 74,218 | 87.76% | 98.16% |
+| ≥ 30 days or no Acute history yet, forecast 0 | 50,369 | 569 | 0 | 10,301 | 9.59% | 0% |
+
+The overshoot is real: young drugs with a positive forecast got 1.8× their actual, and one got 4× (165 units against 40). But it's 0.45% of Track 2's error. Only 4 drugs got a positive forecast while younger than 30 days in six months. A new drug gets no Mart 3 row until it reaches the rare-drug patient cutoff (5 distinct Acute patients), which presumably takes most new drugs a while. The other 1.46% from young drugs is under-forecast of drugs still below that cutoff, which is the rare-drug rule working as designed, not the backoff. The issue's other half, a young drug's closed Sunday getting a positive forecast from the pooled tiers, was already fixed by #42, which forecasts every closed target day as 0.
+
+**Decision**: no cold-start fix.
+
+**Considered options** (each from the issue):
+- *Minimum calendar span*: count a drug's days from `min(first dispensing, as_of − K)`. This adds K, to be tuned against 0.45% of Track 2's error.
+- *Shrinking young drugs toward a catalog-level prior*: this adds a prior and a shrinkage weight, against the same 0.45%.
+- *Excluding Sundays from the pooled tiers*: unnecessary since #41 and #42. Closed days are already out of every tier's day count, and a closed target day is forecast as 0.
+- **No fix — chosen.** Revisit this if a larger extract or a lower rare-drug patient cutoff lets more drugs into Mart 3 while they're still new.
