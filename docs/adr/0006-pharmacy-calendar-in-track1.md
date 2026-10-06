@@ -79,3 +79,31 @@ Full v0.3 backtest, same 185 as-of dates and same retrained Track 1 model as #42
 | Track 2 on open target days: predicted / actual / WAPE | 70,759 / 86,764 / 1.210 | 75,459 / 86,764 / 1.238 |
 
 Only two Sundays in the test window were open (2025-10-05 and 2025-10-26), so the shift comes from weekday rates: no longer diluted by holidays, and, for backed-off drugs, by closed Sundays pooled into the season and overall tiers.
+
+**Update (issue #40): calibrating the first open day after a closure separately.** The residual above is now addressed. The Platt calibrator keeps one slope but gives rows whose snapshot day was closed (오늘_휴무) their own intercept (`PlattCalibrator.after_closure_shift`), fit on the same open-day validation rows. Why the feature underfit, measured on v0.3:
+
+- *Too few post-closure rows in train*: not the cause. They are ~20% of the sampled train set's open-target rows (20,346 of ~102k, over 110 days).
+- *Multi-day closures*: can't be the cause in the test window, whose closures are all single days. Validation has three days after a 2–3-day closure, train eight. A consecutive-closed-days feature couldn't move the test table.
+- *What happens instead*: the classifier gives 오늘_휴무 0.08% of its gain and scores post-closure rows slightly lower than ordinary ones (mean raw score 0.159 vs 0.164). Yet their real visit rate is ~1.34× higher (validation 3.7% vs 2.7%). The pile-up is visible in the sampled train set only as a 1.20× lift, and the remaining-days and expected-visit features explain most of it away. One sigmoid over both kinds of open day then split the difference.
+
+A separate intercept is three Platt parameters fit on ~217k validation rows, 28 of its days post-closure. The richer feature was rejected: it would need the classifier to learn what it already ignores, and nothing in the test window would exercise it. One shift covers single- and multi-day closures alike; the separate intercept was fit on validation, which mixes both, and carries over to the test window's single-day closures (below). A model saved before this change still loads, with a shift of 0, i.e. the old behaviour, and must be retrained to get it.
+
+Full v0.3 backtest, same 185 as-of dates, Track 1 retrained (cutoff 0.159):
+
+| | before | after |
+|---|---|---|
+| Combined WAPE | 0.968 | 0.946 |
+| Track 1 WAPE | 1.030 | 1.005 |
+| Track 1 predicted (actual 614,332) | 645,677 | 633,819 |
+| Test-window Σp (actual 6,478) | 6,915 (1.07×) | 6,882 (1.06×) |
+| Validation precision / recall / F1 | 0.25 / 0.28 / 0.27 | 0.26 / 0.29 / 0.27 |
+
+By target day:
+
+| target day | days | Σp before → after | actual visits | ratio before → after | Visit List / day | Track 1 WAPE before → after |
+|---|---|---|---|---|---|---|
+| closed | 27 | 0 → 0 | 0 | — | 0 | — |
+| first open day after a closure | 27 | 1,153 → 1,464 | 1,412 | 0.82× → 1.04× | 51 → 79 | 0.83 → 0.86 |
+| other open | 131 | 5,762 → 5,417 | 5,066 | 1.14× → 1.07× | 51 → 43 | 1.09 → 1.05 |
+
+Volume is now right on both kinds of open day. The ~1.05× left on both is the validation-to-test drop in the visit rate (2.75% → 2.49% on ordinary days), which no calibration fit on validation can see. Post-closure Track 1 WAPE rose slightly although its volume is now right: the larger Visit List there spreads demand over more customers, and per-drug errors no longer cancel against the earlier under-forecast. Track 2 is unchanged.
